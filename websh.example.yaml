@@ -1,10 +1,12 @@
-# Example websh user config. Install to ~/.config/websh.yaml.
+# Example websh user config (~/.config/websh.yaml).
 # If this file does not exist, the user cannot log in.
+#
+# The easiest way to create this file is:  websh config
+# (it generates the OTP secret and shows a QR code to scan). This sample is for
+# reference / manual editing.
 
 # Required. Base32 TOTP secret, Google Authenticator compatible.
-# Generate one with:  websh-notify is not for this — use:
-#   head -c20 /dev/urandom | base32
-# then add the SAME secret to Google Authenticator / any TOTP app.
+# `websh config` fills this in; to make one by hand: head -c20 /dev/urandom | base32
 otp_secret: "JBSWY3DPEHPK3PXP"
 
 # Optional display name.

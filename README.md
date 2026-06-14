@@ -75,16 +75,38 @@ session). The systemd unit therefore runs `User=root` and must **not** set
 `NoNewPrivileges=true` (breaks setuid) or `ProtectHome` (needs other homes).
 Keep the root-side code minimal; all per-session work runs privilege-dropped.
 
+## First-run setup — `websh config`
+
+Each user runs this **once, as themselves** (no root needed) to create
+`~/.config/websh.yaml` and enroll their OTP:
+
+```sh
+websh config            # creates the file + prints a QR code in the terminal
+websh config --regen    # rotate the OTP secret
+websh config --invert   # flip QR colors for a light-background terminal
+```
+
+It generates a TOTP secret and renders a **scannable QR code right in the
+terminal** — scan it with Google Authenticator (or any TOTP app), and it also
+prints the raw secret for manual entry. A default `local` session is added; edit
+the file to add SSH targets.
+
 ## User config — `~/.config/websh.yaml`
 
-See `websh.example.yaml`. Minimum:
+`websh config` writes this for you. Full schema (see `websh.example.yaml`):
 
 ```yaml
-otp_secret: "BASE32SECRET"     # head -c20 /dev/urandom | base32, also add to your TOTP app
+otp_secret: "BASE32SECRET"     # filled in by `websh config`
 sessions:
   - id: local
     type: local
     name: "本机"
+  - id: gpu01
+    type: ssh
+    name: "GPU 01"
+    host: "gpu01.internal"
+    user: "deploy"             # optional
+    port: 22                   # optional
 ```
 
 `host`, session `id`, and `ssh_options` are validated; dangerous ssh options

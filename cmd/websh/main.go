@@ -52,6 +52,18 @@ type server struct {
 }
 
 func main() {
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "config" {
+		runConfig(args[1:])
+		return
+	}
+	if len(args) > 0 && args[0] == "serve" {
+		args = args[1:]
+	}
+	runServe(args)
+}
+
+func runServe(args []string) {
 	var (
 		bind         = flag.String("bind", "127.0.0.1:9631", "listen address")
 		staticDir    = flag.String("static", "./static", "static assets directory")
@@ -63,7 +75,7 @@ func main() {
 		sessionTTL   = flag.Duration("session-ttl", 7*24*time.Hour, "web login session lifetime")
 		idleTTL      = flag.Duration("idle-ttl", 72*time.Hour, "reclaim tmux sessions with no user input for this long")
 	)
-	flag.Parse()
+	_ = flag.CommandLine.Parse(args)
 
 	if os.Geteuid() != 0 {
 		log.Printf("WARNING: not running as root — only sessions for the current user (%d) will work, and PAM auth needs root", os.Getuid())
