@@ -101,6 +101,10 @@ header button{padding:6px 10px;font-size:13px;}
   padding:10px 16px;font-size:13px;max-width:90%;z-index:50;opacity:0;
   transition:opacity .2s;pointer-events:none;}
 #toast.show{opacity:1;}
+#updateBar{position:fixed;left:0;right:0;top:0;z-index:100;
+  padding:calc(8px + env(safe-area-inset-top)) 10px 8px;background:transparent;}
+#updateBar button{width:100%;background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600;
+  box-shadow:0 2px 8px rgba(0,0,0,.4);}
 </style>
 </head>
 <body>
@@ -110,9 +114,9 @@ header button{padding:6px 10px;font-size:13px;}
     <h1>websh</h1>
     <div class="sub">用本机账号登录（需配置 ~/.config/websh.yaml）</div>
     <input id="username" type="text" placeholder="用户名" autocomplete="username" autocapitalize="off" autocorrect="off" />
+    <input id="password" type="password" placeholder="密码" autocomplete="current-password" />
     <input id="otp" type="text" inputmode="numeric" maxlength="6"
            placeholder="动态验证码（6位）" autocomplete="one-time-code" />
-    <input id="password" type="password" placeholder="密码" autocomplete="current-password" />
     <button id="loginBtn">登录</button>
     <div id="loginErr" class="err"></div>
   </section>
@@ -138,6 +142,7 @@ header button{padding:6px 10px;font-size:13px;}
   </section>
 </div>
 
+<div id="updateBar" class="hidden"><button id="updateBtn">发现新版本 · 点击更新</button></div>
 <div id="toast"></div>
 
 <script src="vendor/xterm.js"></script>

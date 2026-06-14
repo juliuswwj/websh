@@ -28,7 +28,12 @@ async function api(path, opts = {}) {
 const FONT_KEY = 'websh.fontSize';
 let fontSize = parseInt(localStorage.getItem(FONT_KEY) || '14', 10) || 14;
 
-const state = { user: null, sessions: [], tabs: [], terms: new Map(), active: null };
+const state = { user: null, live: [], quickconnects: [], tabs: [], terms: new Map(), active: null };
+
+// PWA update handling: a freshly-installed service worker waits until the user
+// taps the update banner, then activates and the page reloads.
+let waitingWorker = null;
+function offerUpdate(worker) { waitingWorker = worker; $('#updateBar').classList.remove('hidden'); }
 
 // ---- 视图切换 --------------------------------------------------------------
 function show(view) {
@@ -68,28 +73,76 @@ async function enterSessions() {
   const wrap = $('#sessions'); wrap.innerHTML = ''; wrap.appendChild(el('div', 'mut', '加载中…'));
   try {
     const r = await api('/api/sessions');
-    state.sessions = r.sessions || [];
+    state.live = r.live || [];
+    state.quickconnects = r.quickconnects || [];
   } catch (e) {
     wrap.innerHTML = ''; wrap.appendChild(el('div', 'err', '加载会话失败：' + e.message)); return;
   }
   renderSessions();
 }
 
+function srvCard(icon, name, desc, onclick) {
+  const card = el('div', 'srv');
+  card.appendChild(el('span', 'ic', icon));
+  const meta = el('div', 'meta');
+  meta.appendChild(el('div', 'name', name));
+  if (desc) meta.appendChild(el('div', 'desc', desc));
+  card.appendChild(meta);
+  card.onclick = onclick;
+  return card;
+}
+
 function renderSessions() {
   const wrap = $('#sessions'); wrap.innerHTML = '';
-  if (!state.sessions.length) { wrap.appendChild(el('div', 'mut', '配置文件里没有会话')); return; }
-  for (const s of state.sessions) {
-    const card = el('div', 'srv');
-    card.appendChild(el('span', 'ic', s.type === 'ssh' ? '🌐' : '🖥️'));
-    const meta = el('div', 'meta');
-    meta.appendChild(el('div', 'name', s.name || s.id));
-    const desc = s.type === 'ssh' ? ('ssh · ' + (s.host || '')) : '本机';
-    meta.appendChild(el('div', 'desc', desc));
-    card.appendChild(meta);
-    card.appendChild(el('span', 'dot' + (s.live ? ' live' : '')));
-    card.onclick = () => openSession(s);
+
+  // 新建 bash
+  wrap.appendChild(srvCard('➕', '新建 Bash', '本机新终端', () => newBash()));
+
+  // 配置里的 SSH 远端
+  for (const q of state.quickconnects) {
+    wrap.appendChild(srvCard('🌐', '＋ ' + (q.name || q.id), 'ssh · ' + (q.host || ''),
+      () => openSession({ id: q.id, name: q.name || q.id, type: q.type })));
+  }
+
+  // 运行中的 tmux 会话
+  if (state.live.length) wrap.appendChild(el('div', 'mut', '运行中的会话'));
+  for (const s of state.live) {
+    const card = srvCard(s.type === 'ssh' ? '🌐' : '🖥️', s.label,
+      (s.type === 'ssh' ? 'ssh' : 'bash') + ' · id ' + s.id + (s.attached ? ' · 已连接' : ''),
+      () => openSession({ id: s.id, name: s.label, type: s.type }));
+    const ren = el('button', 'btn-sm', '✎'); ren.onclick = (e) => { e.stopPropagation(); renameSession(s.id, s.label); };
+    const del = el('button', 'btn-sm', '🗑'); del.onclick = (e) => { e.stopPropagation(); deleteSession(s.id, s.label); };
+    card.appendChild(ren); card.appendChild(del);
     wrap.appendChild(card);
   }
+}
+
+async function newBash() {
+  try {
+    const r = await api('/api/sessions/new', { method: 'POST' });
+    openSession({ id: r.id, name: r.id, type: 'bash' });
+  } catch (e) { toast('新建失败：' + e.message); }
+}
+
+async function renameSession(id, current) {
+  const name = prompt('会话名称', current === id ? '' : current);
+  if (name === null) return;
+  try {
+    await api(`/api/sessions/${encodeURIComponent(id)}/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() }) });
+    const t = state.tabs.find(x => x.id === id);
+    if (t) { t.name = name.trim() || id; renderTabbar(); if (state.active === t) $('#workTitle').textContent = t.name; }
+    if (!$('#sessions').classList.contains('hidden')) enterSessions();
+  } catch (e) { toast('改名失败：' + e.message); }
+}
+
+async function deleteSession(id, label) {
+  if (!confirm(`删除会话「${label}」？会终止其中运行的程序。`)) return;
+  try {
+    await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  } catch (e) { toast('删除失败：' + e.message); return; }
+  const t = state.tabs.find(x => x.id === id);
+  if (t) closeTab(t);
+  enterSessions();
 }
 
 // ---- 通知开关 --------------------------------------------------------------
@@ -131,7 +184,6 @@ function openSession(s) {
     t = { id: s.id, name: s.name || s.id, type: s.type };
     state.tabs.push(t);
   }
-  $('#workTitle').textContent = state.user || 'websh';
   show('work');
   renderTabbar();
   setActive(t);
@@ -139,7 +191,7 @@ function openSession(s) {
 
 function renderTabbar() {
   const bar = $('#tabbar'); bar.innerHTML = '';
-  const add = el('div', 'tab tabadd', '＋'); add.onclick = () => enterSessions(); bar.appendChild(add);
+  const add = el('div', 'tab tabadd', '＋'); add.title = '新建 Bash'; add.onclick = () => newBash(); bar.appendChild(add);
   for (const t of state.tabs) {
     const tab = el('div', 'tab' + (t === state.active ? ' active' : ''));
     const d = el('span', 'dot' + (t._status ? ' ' + t._status : '')); tab.appendChild(d);
@@ -168,6 +220,7 @@ function closeTab(t) {
 function setActive(t) {
   state.active = t;
   t._wait = false;
+  $('#workTitle').textContent = t.name;
   renderTabbar();
   const pane = $('#pane');
   for (const v of pane.querySelectorAll('.view')) v.classList.add('hidden');
@@ -207,7 +260,7 @@ function renderKeys(rec) {
     mk('Home', ctl('\x1b[H')); mk('End', ctl('\x1b[F')); mk('PgUp', ctl('\x1b[5~')); mk('PgDn', ctl('\x1b[6~'));
     mk('⌫', ctl('\x7f')); mk('Del', ctl('\x1b[3~'));
     mk('^A', ctl('\x01')); mk('^E', ctl('\x05')); mk('^C', ctl('\x03')); mk('^D', ctl('\x04'));
-    mk('^K', ctl('\x0b')); mk('^U', ctl('\x15')); mk('^W', ctl('\x17')); mk('^R', ctl('\x12'));
+    mk('^B', ctl('\x02')); mk('^K', ctl('\x0b')); mk('^U', ctl('\x15')); mk('^W', ctl('\x17')); mk('^R', ctl('\x12'));
     mk('^Z', ctl('\x1a')); mk('^L', ctl('\x0c')); mk('^T', ctl('\x14'));
     mk('清屏', () => rec.term.clear());
   } else {
@@ -253,7 +306,11 @@ function buildTermView(t) {
   return v;
 }
 
-function sendData(rec, d) { if (rec.ws && rec.ws.readyState === 1) rec.ws.send(d); }
+// Terminal input goes as BINARY frames (raw PTY bytes); control messages
+// (resize/presence/pong) go as JSON text frames. The server distinguishes the
+// two by frame type, so keystrokes must not be sent as text.
+const ENC = new TextEncoder();
+function sendData(rec, d) { if (rec.ws && rec.ws.readyState === 1) rec.ws.send(ENC.encode(d)); }
 
 function termStatus(rec, st) {
   rec.tab._status = st;
@@ -270,20 +327,28 @@ function connectTerm(rec) {
   if (rec.closing) return;
   const t = rec.tab;
   clearTimeout(rec.reconnectTimer);
-  try { rec.ws && rec.ws.readyState <= 1 && rec.ws.close(); } catch {}
+  // Detach the previous socket's handlers before closing it, so its (intentional)
+  // close does NOT trigger a reconnect — otherwise every reconnect schedules
+  // another one and we loop forever.
+  if (rec.ws) {
+    const old = rec.ws;
+    old.onopen = old.onmessage = old.onerror = old.onclose = null;
+    try { if (old.readyState <= 1) old.close(); } catch {}
+  }
   termStatus(rec, 'wait');
   rec.term.write('\r\n\x1b[90m[连接中…]\x1b[0m\r\n');
   const ws = new WebSocket(wsURL(t));
   ws.binaryType = 'arraybuffer';
   rec.ws = ws;
-  ws.onopen = () => { rec.retries = 0; termStatus(rec, 'on'); setTimeout(() => { sendResize(rec); sendPresence(rec); }, 60); };
+  ws.onopen = () => { if (rec.ws !== ws) return; rec.retries = 0; termStatus(rec, 'on'); setTimeout(() => { sendResize(rec); sendPresence(rec); }, 60); };
   ws.onmessage = (ev) => {
+    if (rec.ws !== ws) return;
     if (typeof ev.data === 'string') { handleCtl(rec, ev.data); return; }
     rec.term.write(new Uint8Array(ev.data));
   };
-  ws.onerror = () => termStatus(rec, 'err');
+  ws.onerror = () => { if (rec.ws === ws) termStatus(rec, 'err'); };
   ws.onclose = (e) => {
-    if (rec.closing) return;
+    if (rec.closing || rec.ws !== ws) return;   // ignore stale/replaced sockets
     if (e.code === 4401) { termStatus(rec, 'err'); rec.term.write('\r\n\x1b[91m会话失效，请重新登录\x1b[0m\r\n'); return; }
     scheduleReconnect(rec);
   };
@@ -377,10 +442,11 @@ function changeFont(delta) {
 // ---- 启动 ------------------------------------------------------------------
 function bind() {
   $('#loginBtn').onclick = doLogin;
-  $('#password').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+  $('#otp').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
   $('#logoutBtn').onclick = logout;
   $('#notifyBtn').onclick = enablePush;
   $('#backBtn').onclick = () => enterSessions();
+  $('#workTitle').onclick = () => { const t = state.active; if (t) renameSession(t.id, t.name); };
   $('#fontInc').onclick = () => changeFont(1);
   $('#fontDec').onclick = () => changeFont(-1);
 
@@ -389,8 +455,25 @@ function bind() {
   window.addEventListener('blur', broadcastPresence);
   window.addEventListener('online', reconnectStale);
 
+  $('#updateBtn').onclick = () => { $('#updateBar').classList.add('hidden'); if (waitingWorker) waitingWorker.postMessage({ type: 'SKIP_WAITING' }); };
+
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register(BASE + 'service-worker.js', { scope: BASE }).catch(() => {});
+    navigator.serviceWorker.register(BASE + 'service-worker.js', { scope: BASE }).then(reg => {
+      if (reg.waiting && navigator.serviceWorker.controller) offerUpdate(reg.waiting);
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (nw) nw.addEventListener('statechange', () => {
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) offerUpdate(nw);
+        });
+      });
+      // Re-check for a new version whenever the app comes to the foreground.
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+    }).catch(() => {});
+    // When the new SW takes over (after the user taps update), reload once.
+    let swReloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (swReloaded) return; swReloaded = true; location.reload();
+    });
     navigator.serviceWorker.addEventListener('message', (ev) => {
       const tabId = ev.data && ev.data.tabId;
       if (tabId) { const t = state.tabs.find(x => x.id === tabId); if (t) setActive(t); }

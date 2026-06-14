@@ -23,12 +23,14 @@ import (
 // be rejected in this case.
 var ErrNoConfig = errors.New("websh config not found")
 
-// SessionSpec is one selectable session in the picker.
-type SessionSpec struct {
-	ID         string   `yaml:"id"`
-	Type       string   `yaml:"type"` // "local" | "ssh"
-	Name       string   `yaml:"name"`
-	Host       string   `yaml:"host,omitempty"`
+// Remote is a configured SSH target shown as a quick-connect in the picker.
+// Local shells are created ad-hoc ("+ new bash"), so they are not configured
+// here. The session id is derived from the host (sanitized) unless ID is set
+// explicitly — only needed to disambiguate two remotes on the same host.
+type Remote struct {
+	ID         string   `yaml:"id,omitempty"` // optional override; default = slug(host)
+	Name       string   `yaml:"name,omitempty"`
+	Host       string   `yaml:"host"`
 	User       string   `yaml:"user,omitempty"`
 	Port       int      `yaml:"port,omitempty"`
 	SSHOptions []string `yaml:"ssh_options,omitempty"`
@@ -36,9 +38,9 @@ type SessionSpec struct {
 
 // Config is the parsed websh.yaml.
 type Config struct {
-	OTPSecret   string        `yaml:"otp_secret"`
-	DisplayName string        `yaml:"display_name,omitempty"`
-	Sessions    []SessionSpec `yaml:"sessions"`
+	OTPSecret   string   `yaml:"otp_secret"`
+	DisplayName string   `yaml:"display_name,omitempty"`
+	Remotes     []Remote `yaml:"remotes"`
 }
 
 var (
@@ -97,49 +99,67 @@ func (c *Config) validate() error {
 		return fmt.Errorf("otp_secret is not valid base32: %w", err)
 	}
 	seen := map[string]bool{}
-	for i := range c.Sessions {
-		s := &c.Sessions[i]
-		if !idRe.MatchString(s.ID) {
-			return fmt.Errorf("session id %q must match [A-Za-z0-9_-]+", s.ID)
+	for i := range c.Remotes {
+		r := &c.Remotes[i]
+		if !hostRe.MatchString(r.Host) {
+			return fmt.Errorf("remote host %q must match [A-Za-z0-9._-]+", r.Host)
 		}
-		if seen[s.ID] {
-			return fmt.Errorf("duplicate session id %q", s.ID)
+		if r.ID == "" {
+			r.ID = slugify(r.Host)
 		}
-		seen[s.ID] = true
-		switch s.Type {
-		case "local":
-			// nothing else required
-		case "ssh":
-			if !hostRe.MatchString(s.Host) {
-				return fmt.Errorf("session %q: host %q must match [A-Za-z0-9._-]+", s.ID, s.Host)
-			}
-			if s.User != "" && !hostRe.MatchString(s.User) {
-				return fmt.Errorf("session %q: invalid ssh user %q", s.ID, s.User)
-			}
-			if s.Port != 0 && (s.Port < 1 || s.Port > 65535) {
-				return fmt.Errorf("session %q: port out of range", s.ID)
-			}
-			for _, opt := range s.SSHOptions {
-				low := strings.ToLower(opt)
-				for _, bad := range dangerousSSHOpt {
-					if strings.Contains(low, bad) {
-						return fmt.Errorf("session %q: ssh option %q is not allowed", s.ID, opt)
-					}
+		if !idRe.MatchString(r.ID) {
+			return fmt.Errorf("remote id %q must match [A-Za-z0-9_-]+", r.ID)
+		}
+		if seen[r.ID] {
+			return fmt.Errorf("duplicate remote id %q (two remotes on the same host? set a distinct id:)", r.ID)
+		}
+		seen[r.ID] = true
+		if r.Name == "" {
+			r.Name = r.Host
+		}
+		if r.User != "" && !hostRe.MatchString(r.User) {
+			return fmt.Errorf("remote %q: invalid ssh user %q", r.ID, r.User)
+		}
+		if r.Port != 0 && (r.Port < 1 || r.Port > 65535) {
+			return fmt.Errorf("remote %q: port out of range", r.ID)
+		}
+		for _, opt := range r.SSHOptions {
+			low := strings.ToLower(opt)
+			for _, bad := range dangerousSSHOpt {
+				if strings.Contains(low, bad) {
+					return fmt.Errorf("remote %q: ssh option %q is not allowed", r.ID, opt)
 				}
 			}
-		default:
-			return fmt.Errorf("session %q: unknown type %q (want local|ssh)", s.ID, s.Type)
 		}
 	}
 	return nil
 }
 
-// Find returns the session spec with the given id, or false.
-func (c *Config) Find(id string) (SessionSpec, bool) {
-	for _, s := range c.Sessions {
-		if s.ID == id {
-			return s, true
+// slugify maps a host to a tmux-safe session id ([A-Za-z0-9_-]).
+func slugify(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
 		}
 	}
-	return SessionSpec{}, false
+	if b.Len() == 0 {
+		return "remote"
+	}
+	return b.String()
+}
+
+// ValidID reports whether id is a usable session id ([A-Za-z0-9_-]+).
+func ValidID(id string) bool { return idRe.MatchString(id) }
+
+// FindRemote returns the remote with the given (derived) id, or false.
+func (c *Config) FindRemote(id string) (Remote, bool) {
+	for _, r := range c.Remotes {
+		if r.ID == id {
+			return r, true
+		}
+	}
+	return Remote{}, false
 }

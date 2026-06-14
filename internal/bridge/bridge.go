@@ -9,16 +9,23 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
-
-	"websh/internal/session"
 )
 
+// PTY is the terminal endpoint the bridge pumps to/from (satisfied by
+// *session.Client). Defined as an interface for testability.
+type PTY interface {
+	io.Reader
+	io.Writer
+	Resize(cols, rows uint16) error
+}
+
 const (
-	heartbeatInterval = 20 * time.Second
+	heartbeatInterval = 15 * time.Second
 	bellDebounce      = 3 * time.Second
 	readBufSize       = 32 * 1024
 )
@@ -31,20 +38,23 @@ type frame struct {
 // Bridge couples one websocket with one PTY client.
 type Bridge struct {
 	ws     *websocket.Conn
-	client *session.Client
+	client PTY
 	out    chan frame
 
 	// OnPresence is called with "foreground"/"background" presence updates.
 	OnPresence func(state string)
 	// OnAttention is called (debounced) when the PTY emits a bell.
 	OnAttention func()
+	// Heartbeat overrides the ping interval (keeps idle connections alive
+	// through reverse-proxy idle timeouts). Zero uses the default.
+	Heartbeat time.Duration
 
 	bmu      sync.Mutex
 	lastBell time.Time
 }
 
 // New creates a bridge.
-func New(ws *websocket.Conn, client *session.Client) *Bridge {
+func New(ws *websocket.Conn, client PTY) *Bridge {
 	ws.SetReadLimit(1 << 20)
 	return &Bridge{ws: ws, client: client, out: make(chan frame, 256)}
 }
@@ -88,7 +98,11 @@ func (b *Bridge) Run(ctx context.Context) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(heartbeatInterval)
+		hb := b.Heartbeat
+		if hb <= 0 {
+			hb = heartbeatInterval
+		}
+		t := time.NewTicker(hb)
 		defer t.Stop()
 		ping := []byte(`{"type":"ping"}`)
 		for {

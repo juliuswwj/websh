@@ -27,9 +27,9 @@ jobs:
         run: |
           pkg=dist/websh
           mkdir -p "$pkg"
+          # Web UI is embedded in the binary (//go:embed), so no static/ to ship.
           go build -trimpath -ldflags "-s -w" -o "$pkg/websh" ./cmd/websh
           CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$pkg/websh-notify" ./cmd/websh-notify
-          cp -r static "$pkg/"
           cp websh.service nginx.example.conf websh.example.yaml README.md "$pkg/"
           mkdir -p "$pkg/pam.d" && cp pam.d/websh "$pkg/pam.d/websh"
           tar -C dist -czf "websh-${GITHUB_REF_NAME}-linux-amd64.tar.gz" websh

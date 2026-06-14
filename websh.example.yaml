@@ -12,19 +12,19 @@ otp_secret: "JBSWY3DPEHPK3PXP"
 # Optional display name.
 display_name: "Wen Jun"
 
-sessions:
-  # Local shell on this server (tmux on the host).
-  - id: local
-    type: local
-    name: "本机"
-
-  # SSH to a remote host using THIS user's own ~/.ssh keys.
-  - id: gpu01
-    type: ssh
-    name: "GPU 01"
-    host: "gpu01.internal"      # validated: [A-Za-z0-9._-]
-    user: "deploy"              # optional ssh login user
-    port: 22                    # optional
-    ssh_options:                # optional, ProxyCommand/LocalCommand rejected
+# SSH quick-connects. Local shells are NOT configured here — create them in the
+# UI with "+ new bash". Each remote connects with this user's own ~/.ssh keys.
+remotes:
+  - host: "gpu01.internal"     # required; the session id is derived from it
+    name: "GPU 01"             # optional display name (defaults to host)
+    user: "deploy"             # optional ssh login user
+    port: 22                   # optional
+    ssh_options:               # optional; ProxyCommand/LocalCommand rejected
       - "-o"
       - "ServerAliveInterval=30"
+
+  # id is derived from host ("gpu01_internal" above). Set it explicitly only to
+  # disambiguate two remotes on the same host:
+  # - id: db-ro
+  #   host: "db.internal"
+  #   user: "readonly"

@@ -19,7 +19,7 @@ func TestWriteConfigValidates(t *testing.T) {
 	}
 	cfg := &config.Config{
 		OTPSecret: key.Secret(),
-		Sessions:  []config.SessionSpec{{ID: "local", Type: "local", Name: "本机"}},
+		Remotes:   []config.Remote{{Host: "gpu01.internal", User: "deploy"}},
 	}
 	p := filepath.Join(t.TempDir(), "websh.yaml")
 	if err := writeConfig(p, cfg); err != nil {
@@ -29,7 +29,7 @@ func TestWriteConfigValidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generated config rejected by loader: %v", err)
 	}
-	if got.OTPSecret != cfg.OTPSecret || len(got.Sessions) != 1 {
+	if got.OTPSecret != cfg.OTPSecret || len(got.Remotes) != 1 {
 		t.Fatalf("roundtrip mismatch: %+v", got)
 	}
 }

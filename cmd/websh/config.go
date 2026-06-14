@@ -52,9 +52,8 @@ func runConfig(args []string) {
 		}
 		cfg.OTPSecret = key.Secret()
 	}
-	if len(cfg.Sessions) == 0 {
-		cfg.Sessions = []config.SessionSpec{{ID: "local", Type: "local", Name: "本机"}}
-	}
+	// Local shells are created ad-hoc in the UI ("+ new bash"); only SSH remotes
+	// are configured (under `remotes:`), so nothing is seeded here.
 
 	// Persist when we created the file or changed the secret.
 	if needSecret || !existed {

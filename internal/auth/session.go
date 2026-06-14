@@ -3,7 +3,9 @@ package auth
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -18,17 +20,57 @@ type Session struct {
 	Exp  time.Time
 }
 
-// Store is an in-memory web-session store with a fixed TTL (7 days).
+// Store is a web-session store with a fixed TTL (7 days), optionally persisted
+// to a JSON file so sessions survive a daemon restart.
 type Store struct {
-	mu  sync.Mutex
-	m   map[string]*Session
-	ttl time.Duration
+	mu   sync.Mutex
+	m    map[string]*Session
+	ttl  time.Duration
+	path string
 }
 
-// NewStore creates a session store with the given TTL.
-func NewStore(ttl time.Duration) *Store {
-	s := &Store{m: make(map[string]*Session), ttl: ttl}
+// NewStore creates a session store with the given TTL. If path is non-empty the
+// store is loaded from and persisted to that file (live, non-expired sessions
+// only), so restarting the daemon does not force everyone to log in again.
+func NewStore(ttl time.Duration, path string) *Store {
+	s := &Store{m: make(map[string]*Session), ttl: ttl, path: path}
+	if path != "" {
+		s.load()
+	}
 	return s
+}
+
+// load reads persisted sessions, dropping any that have expired.
+func (s *Store) load() {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return
+	}
+	var m map[string]*Session
+	if json.Unmarshal(data, &m) != nil {
+		return
+	}
+	now := time.Now()
+	for sid, sess := range m {
+		if sess != nil && now.Before(sess.Exp) {
+			s.m[sid] = sess
+		}
+	}
+}
+
+// saveLocked atomically writes the session map. The caller holds s.mu.
+func (s *Store) saveLocked() {
+	if s.path == "" {
+		return
+	}
+	data, err := json.Marshal(s.m)
+	if err != nil {
+		return
+	}
+	tmp := s.path + ".tmp"
+	if os.WriteFile(tmp, data, 0o600) == nil {
+		_ = os.Rename(tmp, s.path)
+	}
 }
 
 // TTL returns the configured session lifetime.
@@ -39,6 +81,7 @@ func (s *Store) New(user, uid string) string {
 	sid := randToken(32)
 	s.mu.Lock()
 	s.m[sid] = &Session{User: user, UID: uid, Exp: time.Now().Add(s.ttl)}
+	s.saveLocked()
 	s.mu.Unlock()
 	return sid
 }
@@ -65,6 +108,7 @@ func (s *Store) Get(sid string) *Session {
 func (s *Store) Delete(sid string) {
 	s.mu.Lock()
 	delete(s.m, sid)
+	s.saveLocked()
 	s.mu.Unlock()
 }
 
@@ -79,10 +123,14 @@ func (s *Store) GC(stop <-chan struct{}) {
 		case <-t.C:
 			now := time.Now()
 			s.mu.Lock()
+			n := len(s.m)
 			for sid, sess := range s.m {
 				if now.After(sess.Exp) {
 					delete(s.m, sid)
 				}
+			}
+			if len(s.m) != n {
+				s.saveLocked()
 			}
 			s.mu.Unlock()
 		}

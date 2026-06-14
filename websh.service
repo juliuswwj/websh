@@ -8,9 +8,9 @@ After=network.target
 # (breaks setuid) or ProtectHome (must read other users' home directories).
 User=root
 Type=simple
+# The web UI is embedded in the binary; no static directory to deploy.
 ExecStart=/usr/local/bin/websh \
   --bind 127.0.0.1:9631 \
-  --static /opt/websh/static \
   --secrets /var/lib/websh/secrets.json \
   --push-store /var/lib/websh/push_subs.json \
   --pam-service websh \
@@ -18,7 +18,10 @@ ExecStart=/usr/local/bin/websh \
 Restart=on-failure
 RestartSec=2
 StateDirectory=websh
-WorkingDirectory=/opt/websh
+# /run/websh holds the web-session state file; preserve it across restarts so a
+# restart doesn't log everyone out (cleared on reboot, which is fine).
+RuntimeDirectory=websh
+RuntimeDirectoryPreserve=yes
 
 [Install]
 WantedBy=multi-user.target

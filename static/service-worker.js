@@ -1,7 +1,7 @@
 /* websh service worker: app-shell cache + Web Push */
 'use strict';
 
-const CACHE = 'websh-shell-v1';
+const CACHE = 'websh-shell-v8';
 // Scope-relative URLs (the SW is registered with the app's BASE scope).
 const SHELL = [
   './',
@@ -14,8 +14,13 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (e) => {
-  self.skipWaiting();
+  // Do NOT skipWaiting automatically: a new SW waits until the page asks to
+  // update (so the terminal isn't reloaded out from under the user).
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
+});
+
+self.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('activate', (e) => {

