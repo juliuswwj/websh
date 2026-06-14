@@ -1,0 +1,5 @@
+# PAM service for websh — install to /etc/pam.d/websh
+# Authenticates against the system's standard Unix accounts (pam_unix via
+# common-auth), which requires the websh daemon to run as root to read /etc/shadow.
+@include common-auth
+@include common-account

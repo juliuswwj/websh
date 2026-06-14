@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+      - name: Build release bundle
+        run: |
+          pkg=dist/websh
+          mkdir -p "$pkg"
+          go build -trimpath -ldflags "-s -w" -o "$pkg/websh" ./cmd/websh
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$pkg/websh-notify" ./cmd/websh-notify
+          cp -r static "$pkg/"
+          cp websh.service nginx.example.conf websh.example.yaml README.md "$pkg/"
+          mkdir -p "$pkg/pam.d" && cp pam.d/websh "$pkg/pam.d/websh"
+          tar -C dist -czf "websh-${GITHUB_REF_NAME}-linux-amd64.tar.gz" websh
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: websh-*-linux-amd64.tar.gz

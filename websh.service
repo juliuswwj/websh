@@ -1,0 +1,24 @@
+[Unit]
+Description=websh mobile shell terminal
+After=network.target
+
+[Service]
+# Must run as root: reads each user's ~/.config/websh.yaml and spawns shells as
+# that user (drops privileges per session). Do NOT set NoNewPrivileges=true
+# (breaks setuid) or ProtectHome (must read other users' home directories).
+User=root
+Type=simple
+ExecStart=/usr/local/bin/websh \
+  --bind 127.0.0.1:9631 \
+  --static /opt/websh/static \
+  --secrets /var/lib/websh/secrets.json \
+  --push-store /var/lib/websh/push_subs.json \
+  --pam-service websh \
+  --secure-cookie
+Restart=on-failure
+RestartSec=2
+StateDirectory=websh
+WorkingDirectory=/opt/websh
+
+[Install]
+WantedBy=multi-user.target

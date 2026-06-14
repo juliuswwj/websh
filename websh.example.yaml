@@ -1,0 +1,28 @@
+# Example websh user config. Install to ~/.config/websh.yaml.
+# If this file does not exist, the user cannot log in.
+
+# Required. Base32 TOTP secret, Google Authenticator compatible.
+# Generate one with:  websh-notify is not for this — use:
+#   head -c20 /dev/urandom | base32
+# then add the SAME secret to Google Authenticator / any TOTP app.
+otp_secret: "JBSWY3DPEHPK3PXP"
+
+# Optional display name.
+display_name: "Wen Jun"
+
+sessions:
+  # Local shell on this server (tmux on the host).
+  - id: local
+    type: local
+    name: "本机"
+
+  # SSH to a remote host using THIS user's own ~/.ssh keys.
+  - id: gpu01
+    type: ssh
+    name: "GPU 01"
+    host: "gpu01.internal"      # validated: [A-Za-z0-9._-]
+    user: "deploy"              # optional ssh login user
+    port: 22                    # optional
+    ssh_options:                # optional, ProxyCommand/LocalCommand rejected
+      - "-o"
+      - "ServerAliveInterval=30"
