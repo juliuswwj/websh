@@ -53,6 +53,7 @@ type server struct {
 	notifySecret []byte
 	limiter      *limiter
 	wsHeartbeat  time.Duration
+	notifyURL    string
 }
 
 func main() {
@@ -78,7 +79,6 @@ func runServe(args []string) {
 		secureCookie = flag.Bool("secure-cookie", false, "set Secure flag on the session cookie (enable behind HTTPS)")
 		sessionTTL   = flag.Duration("session-ttl", 7*24*time.Hour, "web login session lifetime")
 		sessionStore = flag.String("session-store", "/run/websh/sessions.json", "persist web sessions here so they survive a restart (empty = in-memory only)")
-		idleTTL      = flag.Duration("idle-ttl", 72*time.Hour, "reclaim tmux sessions with no user input for this long")
 		wsHeartbeat  = flag.Duration("ws-heartbeat", 15*time.Second, "websocket heartbeat interval; must be shorter than any reverse-proxy idle timeout")
 	)
 	_ = flag.CommandLine.Parse(args)
@@ -112,13 +112,12 @@ func runServe(args []string) {
 		notifySecret: sec.notifySecretBytes(),
 		limiter:      newLimiter(5, 5*time.Minute),
 		wsHeartbeat:  *wsHeartbeat,
+		mgr:          session.NewManager(),
+		notifyURL:    "http://" + loopbackAddr(*bind) + "/internal/notify",
 	}
-	notifyURL := "http://" + loopbackAddr(*bind) + "/internal/notify"
-	srv.mgr = session.NewManager(*idleTTL, notifyURL, srv.notifyToken)
 
 	stop := make(chan struct{})
 	go srv.sessions.GC(stop)
-	go srv.mgr.Janitor(stop)
 
 	httpSrv := &http.Server{Addr: *bind, Handler: srv.routes()}
 
@@ -144,12 +143,11 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/logout", s.handleLogout)
 	mux.HandleFunc("GET /api/me", s.handleMe)
 	mux.HandleFunc("GET /api/sessions", s.handleSessions)
-	mux.HandleFunc("POST /api/sessions/new", s.handleNewBash)
-	mux.HandleFunc("POST /api/sessions/{id}/rename", s.handleRename)
-	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleDeleteSession)
+	mux.HandleFunc("POST /api/sessions/rename", s.handleRename)
+	mux.HandleFunc("POST /api/sessions/kill", s.handleKill)
 	mux.HandleFunc("GET /api/push/vapid-public-key", s.handleVAPIDKey)
 	mux.HandleFunc("POST /api/push/subscribe", s.handleSubscribe)
-	mux.HandleFunc("GET /ws/term/{id}", s.handleWSTerm)
+	mux.HandleFunc("GET /ws", s.handleWS)
 	mux.HandleFunc("POST /internal/notify", s.handleInternalNotify)
 	mux.HandleFunc("GET /", s.handleStatic)
 	return s.logged(mux)
@@ -173,7 +171,7 @@ func isInteresting(p string) bool {
 	if p == "/" {
 		return true
 	}
-	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/ws/") || strings.HasPrefix(p, "/internal/")
+	return p == "/ws" || strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/ws/") || strings.HasPrefix(p, "/internal/")
 }
 
 type logRW struct {
@@ -292,79 +290,113 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 
 // ---- sessions --------------------------------------------------------------
 
-// handleSessions returns the live tmux sessions plus the configured
-// quick-connect templates (local/ssh) for starting new ones.
+// handleSessions returns ALL of the user's tmux sessions plus the configured
+// SSH remotes (for starting new ones).
 func (s *server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	sess, cfg, u, ok := s.sessionUser(w, r)
 	if !ok {
 		return
 	}
+	remoteByName := map[string]bool{}
+	for _, rmt := range cfg.Remotes {
+		remoteByName[rmt.ID] = true
+	}
 	live := make([]map[string]any, 0)
 	for _, li := range s.mgr.List(u) {
 		typ := "bash"
-		if _, ok := cfg.FindRemote(li.ID); ok {
+		// "<n>@<remoteid>" is a session on a configured SSH remote.
+		if at := strings.LastIndex(li.Name, "@"); at >= 0 && remoteByName[li.Name[at+1:]] {
 			typ = "ssh"
 		}
-		label := li.Label
-		if label == "" {
-			label = li.ID
-		}
-		live = append(live, map[string]any{"id": li.ID, "label": label, "type": typ, "attached": li.Attached})
+		live = append(live, map[string]any{"name": li.Name, "type": typ, "attached": li.Attached, "window": li.Window})
 	}
-	qc := make([]map[string]any, 0, len(cfg.Remotes))
+	remotes := make([]map[string]any, 0, len(cfg.Remotes))
 	for _, rmt := range cfg.Remotes {
-		qc = append(qc, map[string]any{"id": rmt.ID, "name": rmt.Name, "type": "ssh", "host": rmt.Host})
+		remotes = append(remotes, map[string]any{"id": rmt.ID, "name": rmt.Name, "host": rmt.Host})
 	}
-	writeJSON(w, map[string]any{"user": sess.User, "display_name": cfg.DisplayName, "live": live, "quickconnects": qc})
+	writeJSON(w, map[string]any{"user": sess.User, "display_name": cfg.DisplayName, "live": live, "remotes": remotes})
 }
 
-// handleNewBash allocates the next free numeric id for a new local bash session.
-func (s *server) handleNewBash(w http.ResponseWriter, r *http.Request) {
-	_, _, u, ok := s.sessionUser(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, map[string]any{"id": s.mgr.NextBashID(u)})
-}
-
-// handleRename sets a session's display label.
+// handleRename renames a tmux session. For a remote session "<prefix>@<id>" only
+// the prefix changes ("@<id>" identifies the remote and is preserved); the remote
+// tmux session is renamed too so the two stay in sync.
 func (s *server) handleRename(w http.ResponseWriter, r *http.Request) {
-	_, _, u, ok := s.sessionUser(w, r)
+	_, cfg, u, ok := s.sessionUser(w, r)
 	if !ok {
 		return
 	}
-	id := r.PathValue("id")
-	if !config.ValidID(id) {
-		httpErr(w, http.StatusBadRequest, "bad id")
+	var req struct{ Target, Name string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	var req struct {
-		Name string `json:"name"`
+	plan, err := planRename(req.Target, req.Name, func(id string) bool { _, ok := cfg.FindRemote(id); return ok })
+	if err != nil {
+		httpErr(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	name := strings.TrimSpace(req.Name)
-	if len(name) > 64 {
-		name = name[:64]
+	if plan.remote {
+		rmt, _ := cfg.FindRemote(plan.remoteID)
+		spec := session.Spec{ID: rmt.ID, SSH: true, Host: rmt.Host, User: rmt.User, Port: rmt.Port, SSHOptions: rmt.SSHOptions}
+		if err := s.mgr.RenameRemote(u, spec, plan.oldPrefix, plan.newPrefix); err != nil {
+			httpErr(w, http.StatusBadRequest, "重命名远端会话失败（远端不可达？）")
+			return
+		}
 	}
-	if err := s.mgr.SetLabel(u, id, name); err != nil {
-		httpErr(w, http.StatusInternalServerError, "改名失败")
+	if err := s.mgr.Rename(u, req.Target, plan.newName); err != nil {
+		httpErr(w, http.StatusBadRequest, "改名失败")
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-// handleDeleteSession kills a tmux session.
-func (s *server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+// renamePlan is the resolved outcome of a rename request.
+type renamePlan struct {
+	remote    bool
+	remoteID  string // remote id (the "@<id>" part), for remote sessions
+	oldPrefix string // current remote session name (target's prefix)
+	newPrefix string // new remote session name
+	newName   string // new local (proxy) session name
+}
+
+// planRename resolves a rename, enforcing that "@<id>" is reserved for remote
+// sessions: a remote session keeps its "@<id>" suffix and only its prefix
+// changes (the prefix may not contain '@'); a local session may not contain '@'
+// at all, so it can't masquerade as a remote "<n>@<id>".
+func planRename(target, rawName string, isRemote func(string) bool) (renamePlan, error) {
+	name := strings.TrimSpace(rawName)
+	if at := strings.LastIndex(target, "@"); at >= 0 && isRemote(target[at+1:]) {
+		id := target[at+1:]
+		newPrefix := name
+		if a2 := strings.LastIndex(name, "@"); a2 >= 0 {
+			newPrefix = name[:a2] // ignore any @suffix the client sent; @<id> is fixed
+		}
+		if newPrefix == "" || strings.Contains(newPrefix, "@") {
+			return renamePlan{}, errors.New("会话名不能含 @")
+		}
+		return renamePlan{remote: true, remoteID: id, oldPrefix: target[:at], newPrefix: newPrefix, newName: newPrefix + "@" + id}, nil
+	}
+	if name == "" || strings.Contains(name, "@") {
+		return renamePlan{}, errors.New("本机会话名不能含 @（@ 仅用于远端会话）")
+	}
+	return renamePlan{newName: name}, nil
+}
+
+// handleKill terminates a tmux session.
+func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 	_, _, u, ok := s.sessionUser(w, r)
 	if !ok {
 		return
 	}
-	id := r.PathValue("id")
-	if !config.ValidID(id) {
-		httpErr(w, http.StatusBadRequest, "bad id")
+	var req struct{ Target string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	_ = s.mgr.Kill(u, id)
+	if err := s.mgr.Kill(u, req.Target); err != nil {
+		httpErr(w, http.StatusBadRequest, "删除失败")
+		return
+	}
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -385,65 +417,84 @@ func (s *server) sessionUser(w http.ResponseWriter, r *http.Request) (*auth.Sess
 
 // ---- terminal websocket ----------------------------------------------------
 
-func (s *server) handleWSTerm(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	log.Printf("ws term: path=%s id=%s host=%s origin=%q upgrade=%q ip=%s",
-		r.URL.Path, id, r.Host, r.Header.Get("Origin"), r.Header.Get("Upgrade"), clientIP(r))
+// handleWS is the single terminal websocket: it attaches one top-level tmux
+// client for the user and drives it (switch/new) via control frames.
+func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
+	log.Printf("ws: host=%s origin=%q upgrade=%q ip=%s", r.Host, r.Header.Get("Origin"), r.Header.Get("Upgrade"), clientIP(r))
 
 	sess := s.sessions.FromRequest(r)
 	if sess == nil {
-		log.Printf("ws term: rejected, no session (cookie missing/expired)")
-		// Use the app's relogin code so the client stops retrying.
+		log.Printf("ws: rejected, no session")
 		http.Error(w, "未登录", http.StatusUnauthorized)
 		return
 	}
 	cfg, u, err := config.LoadForUser(sess.User)
 	if err != nil {
-		log.Printf("ws term: config load failed user=%s: %v", sess.User, err)
+		log.Printf("ws: config load failed user=%s: %v", sess.User, err)
 		httpErr(w, http.StatusForbidden, "配置不可用")
 		return
 	}
-	var spec session.Spec
-	if rmt, ok := cfg.FindRemote(id); ok {
-		spec = session.Spec{ID: rmt.ID, SSH: true, Host: rmt.Host, User: rmt.User, Port: rmt.Port, SSHOptions: rmt.SSHOptions}
-	} else {
-		// Not a configured remote: treat as an ad-hoc local bash session.
-		if !config.ValidID(id) {
-			log.Printf("ws term: invalid session id=%q user=%s", id, sess.User)
-			httpErr(w, http.StatusNotFound, "未知会话")
-			return
-		}
-		spec = session.Spec{ID: id} // local shell
-	}
 
-	// InsecureSkipVerify: the upgrade comes through a reverse proxy, so the
-	// Host header forwarded to the backend won't match the browser Origin.
-	// CSRF is already prevented by the SameSite=Lax session cookie (not sent
-	// on cross-site websocket requests).
+	// InsecureSkipVerify: the upgrade comes through a reverse proxy (Origin host
+	// != backend Host). CSRF is prevented by the SameSite=Lax session cookie.
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
-		log.Printf("ws term: accept failed user=%s id=%s: %v", sess.User, id, err)
+		log.Printf("ws: accept failed user=%s: %v", sess.User, err)
 		return
 	}
 	defer c.CloseNow()
-	log.Printf("ws term: connected user=%s id=%s", sess.User, id)
 
-	client, err := s.mgr.Spawn(spec, u, 80, 24)
+	// Make websh-notify work in every shell of this user.
+	_ = session.WriteNotifyFile(u, s.notifyURL, s.notifyToken(sess.User))
+
+	client, err := s.mgr.Attach(u, 80, 24)
 	if err != nil {
-		log.Printf("ws term: spawn failed user=%s id=%s: %v", sess.User, id, err)
+		log.Printf("ws: attach failed user=%s: %v", sess.User, err)
 		_ = c.Write(r.Context(), websocket.MessageBinary, []byte("\r\n\x1b[91m启动会话失败: "+err.Error()+"\x1b[0m\r\n"))
-		c.Close(websocket.StatusInternalError, "spawn failed")
+		c.Close(websocket.StatusInternalError, "attach failed")
 		return
 	}
 	defer client.Close()
+	log.Printf("ws: connected user=%s", sess.User)
 
-	uid, tab := sess.UID, id
+	uid := sess.UID
 	b := bridge.New(c, client)
 	b.Heartbeat = s.wsHeartbeat
-	conn := s.presence.Add(uid, tab, b.Send)
+	conn := s.presence.Add(uid, b.Send)
 	defer s.presence.Remove(conn)
 	b.OnPresence = func(state string) { s.presence.SetState(conn, state) }
-	b.OnAttention = func() { s.attention(uid, tab, "终端需要你的关注") }
+	b.OnAttention = func() { s.attention(uid, "终端需要你的关注") }
+	b.OnSwitch = func(target string) string {
+		if err := client.Switch(target); err != nil {
+			log.Printf("ws: switch user=%s target=%q: %v", sess.User, target, err)
+			return ""
+		}
+		return target
+	}
+	b.OnNew = func(kind, id string) string {
+		var name string
+		var err error
+		if kind == "remote" {
+			rmt, ok := cfg.FindRemote(id)
+			if !ok {
+				return ""
+			}
+			name, err = client.NewRemote(session.Spec{ID: rmt.ID, SSH: true, Host: rmt.Host, User: rmt.User, Port: rmt.Port, SSHOptions: rmt.SSHOptions})
+		} else {
+			name, err = client.NewBash()
+		}
+		if err != nil {
+			log.Printf("ws: new(%s,%q) user=%s: %v", kind, id, sess.User, err)
+			return ""
+		}
+		return name
+	}
+
+	// Tell the client which session it landed on.
+	if name := client.CurrentSession(); name != "" {
+		frame, _ := json.Marshal(map[string]string{"type": "session", "name": name})
+		b.Send(frame)
+	}
 
 	b.Run(r.Context())
 	c.Close(websocket.StatusNormalClosure, "")
@@ -478,7 +529,7 @@ func (s *server) handleInternalNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Session string `json:"session"`
+		User    string `json:"user"`
 		Token   string `json:"token"`
 		Message string `json:"message"`
 	}
@@ -486,36 +537,37 @@ func (s *server) handleInternalNotify(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	if !hmac.Equal([]byte(req.Token), []byte(s.notifyToken(req.Session))) {
+	if !hmac.Equal([]byte(req.Token), []byte(s.notifyToken(req.User))) {
 		httpErr(w, http.StatusForbidden, "bad token")
 		return
 	}
-	uid, slug, ok := session.ParseSessionName(req.Session)
-	if !ok {
-		httpErr(w, http.StatusBadRequest, "bad session")
+	u, err := user.Lookup(req.User)
+	if err != nil {
+		httpErr(w, http.StatusBadRequest, "unknown user")
 		return
 	}
 	msg := strings.TrimSpace(req.Message)
 	if msg == "" {
 		msg = "终端需要你的关注"
 	}
-	s.attention(uid, slug, msg)
+	s.attention(u.Uid, msg)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
 // attention routes an attention event: in-page if a foregrounded tab is live,
 // else a Web Push.
-func (s *server) attention(uid, tab, msg string) {
-	frame, _ := json.Marshal(map[string]any{"type": "attention", "tabId": tab, "message": msg})
-	if s.presence.Notify(uid, tab, frame) {
-		payload, _ := json.Marshal(map[string]any{"title": "websh", "body": msg, "tabId": tab, "url": "/"})
+func (s *server) attention(uid, msg string) {
+	frame, _ := json.Marshal(map[string]any{"type": "attention", "message": msg})
+	if s.presence.Notify(uid, frame) {
+		payload, _ := json.Marshal(map[string]any{"title": "websh", "body": msg, "url": "/"})
 		go s.push.Send(uid, payload)
 	}
 }
 
-func (s *server) notifyToken(sessionName string) string {
+// notifyToken is the per-user token for websh-notify (HMAC of the username).
+func (s *server) notifyToken(username string) string {
 	mac := hmac.New(sha256.New, s.notifySecret)
-	mac.Write([]byte(sessionName))
+	mac.Write([]byte(username))
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 

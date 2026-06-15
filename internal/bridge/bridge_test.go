@@ -51,6 +51,53 @@ func (f *fakePTY) Resize(cols, rows uint16) error {
 	return nil
 }
 
+// TestBridgeSwitch verifies a {type:"switch"} control frame invokes OnSwitch
+// and the bridge replies with the resulting session name.
+func TestBridgeSwitch(t *testing.T) {
+	fp := newFakePTY()
+	gotTarget := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		b := New(c, fp)
+		b.OnSwitch = func(target string) string { gotTarget <- target; return target }
+		b.Run(r.Context())
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+
+	if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"switch","target":"work"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case got := <-gotTarget:
+		if got != "work" {
+			t.Fatalf("OnSwitch target = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnSwitch not called")
+	}
+	// Expect a {type:"session","name":"work"} reply.
+	for {
+		typ, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if typ == websocket.MessageText && strings.Contains(string(data), `"work"`) {
+			return
+		}
+	}
+}
+
 // TestBridgeInputAndResize verifies that binary frames reach the PTY as input
 // and that a JSON resize control frame triggers a PTY resize.
 func TestBridgeInputAndResize(t *testing.T) {

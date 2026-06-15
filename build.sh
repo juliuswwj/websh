@@ -6,7 +6,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-export GOTOOLCHAIN="${GOTOOLCHAIN:-go1.25.11}"
+# Prefer a locally-installed Go SDK and pin GOTOOLCHAIN=local so the build never
+# tries to download a toolchain from go.dev (the system go may be too old and
+# ~/go is ephemeral here, so the go.mod-driven toolchain fetch kept re-running).
+# Extract one with: tar -C /opt/tools -xzf /opt/tools/download/go1.26.3.linux-amd64.tar.gz
+for godir in /opt/tools/go "$HOME/go-sdk/go"; do
+  if [ -x "$godir/bin/go" ]; then export PATH="$godir/bin:$PATH"; break; fi
+done
+export GOTOOLCHAIN="${GOTOOLCHAIN:-local}"
 export CGO_ENABLED=1
 # Force the system gcc: a conda gcc (often exported as $CC) has the wrong
 # sysroot/glibc and fails to link libpam. Override with WEBSH_CC if needed.

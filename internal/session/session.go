@@ -1,14 +1,10 @@
-// Package session spawns and tracks tmux-backed terminal sessions.
+// Package session attaches a single top-level tmux client per websocket and
+// drives it (switch/new/rename/kill) so the user sees and continues ALL of
+// their tmux sessions — not just ones websh created.
 //
-// Each terminal maps to a persistent, per-user tmux session named
-// "websh-<uid>-<slug>". A websocket connection spawns a short-lived PTY running
-// `tmux new-session -A -s <name>` (attach-or-create) as the target user. When
-// the websocket drops, that PTY/attach client dies but the tmux session lives
-// on, so reconnecting reattaches with the screen intact — this is the fix for
-// the reference project's fragile-websocket problem.
-//
-// A background janitor reclaims tmux sessions with no user input for idleTTL
-// (3 days) via `tmux kill-session`.
+// One websocket = one PTY = one tmux client (identified by its slave tty, used
+// as the switch-client target). Sessions are the user's own and are never
+// auto-reclaimed.
 package session
 
 import (
@@ -19,124 +15,112 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
-	"time"
 
 	"github.com/creack/pty"
 )
 
-var errNeedRoot = errors.New("websh must run as root to spawn sessions for other users")
+var (
+	errNeedRoot = errors.New("websh must run as root to spawn sessions for other users")
+	errBadName  = errors.New("invalid tmux session name")
+)
 
-// Spec describes what to run in a session: a local shell, or an SSH connection.
+// Spec describes a session to create: a local shell, or an SSH connection.
 type Spec struct {
-	ID         string // session id (tmux slug)
-	SSH        bool   // false = local shell, true = ssh to Host
+	ID         string // tmux session name to use
+	SSH        bool
 	Host       string
 	User       string
 	Port       int
 	SSHOptions []string
 }
 
-// Manager owns the live tmux-session registry and idle reclamation.
-type Manager struct {
-	mu        sync.Mutex
-	sessions  map[string]*sessInfo // key: tmux session name
-	idleTTL   time.Duration
-	notifyURL string
-	tokenFn   func(sessionName string) string
-}
+// Manager runs tmux commands on behalf of users.
+type Manager struct{}
 
-type sessInfo struct {
-	name      string
-	cred      *syscall.Credential // nil when not dropping privileges
-	home      string
-	lastInput time.Time
-}
+// NewManager creates a session manager.
+func NewManager() *Manager { return &Manager{} }
 
-// NewManager creates a session manager. notifyURL/tokenFn are injected into the
-// shell environment so websh-notify can reach the daemon (token is stateless,
-// derived per session name, so it survives daemon restarts).
-func NewManager(idleTTL time.Duration, notifyURL string, tokenFn func(string) string) *Manager {
-	return &Manager{
-		sessions:  make(map[string]*sessInfo),
-		idleTTL:   idleTTL,
-		notifyURL: notifyURL,
-		tokenFn:   tokenFn,
+// ValidName reports whether s is a usable tmux session name. tmux uses ':' and
+// '.' in target syntax, and we use '|' as a list separator, so those (and
+// control chars) are rejected.
+func ValidName(s string) bool {
+	if s == "" || len(s) > 64 || s[0] == '@' { // leading '@' is a tmux window-id
+		return false
 	}
-}
-
-// SessionName returns the deterministic tmux session name for a uid + config id.
-func SessionName(uid uint32, id string) string {
-	return fmt.Sprintf("websh-%d-%s", uid, id)
-}
-
-// ParseSessionName extracts the uid and slug from a tmux session name.
-func ParseSessionName(name string) (uid string, slug string, ok bool) {
-	rest, found := strings.CutPrefix(name, "websh-")
-	if !found {
-		return "", "", false
+	for _, r := range s {
+		if r < 0x20 || r == ':' || r == '.' || r == '|' {
+			return false
+		}
 	}
-	u, s, found := strings.Cut(rest, "-")
-	if !found || u == "" {
-		return "", "", false
-	}
-	return u, s, true
+	return true
 }
 
-// Client is one PTY/attach connection to a tmux session.
+// Client is one PTY-attached tmux client (one websocket).
 type Client struct {
 	mgr  *Manager
-	name string
+	user *user.User
 	ptmx *os.File
 	cmd  *exec.Cmd
+	tty  string // slave tty path == tmux client_tty, used for switch-client -c
 }
 
-// Spawn attaches (or creates) the tmux session for spec as user u and returns a
-// PTY client. cols/rows seed the initial window size.
-func (m *Manager) Spawn(spec Spec, u *user.User, cols, rows uint16) (*Client, error) {
+// Attach starts a tmux client for user u: attach to the most-recent session if
+// any exist, else create a default one. cols/rows seed the window size.
+func (m *Manager) Attach(u *user.User, cols, rows uint16) (*Client, error) {
 	uid, gid, groups, err := credentials(u)
 	if err != nil {
 		return nil, err
 	}
-	name := SessionName(uid, spec.ID)
-	argv := buildArgv(spec, name)
-
-	attrs := &syscall.SysProcAttr{}
 	var cred *syscall.Credential
 	if os.Geteuid() == 0 {
 		cred = &syscall.Credential{Uid: uid, Gid: gid, Groups: groups}
-		attrs.Credential = cred
 	} else if uid != uint32(os.Getuid()) {
 		return nil, errNeedRoot
 	}
 
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Dir = u.HomeDir
-	cmd.Env = m.buildEnv(u, spec.ID, name)
-
-	ptmx, err := pty.StartWithAttrs(cmd, &pty.Winsize{Rows: rows, Cols: cols}, attrs)
-	if err != nil {
-		return nil, fmt.Errorf("spawn tmux: %w", err)
+	// Attach to a SPECIFIC session: `attach-session` with no -t lands on the most
+	// recent UNATTACHED session, so repeated attaches (refresh/reconnect churn)
+	// hop across every session. Picking an explicit target makes it deterministic
+	// — always the most-recently-active session, i.e. where you left off.
+	var argv []string
+	if target := m.mostRecent(u); target != "" {
+		argv = []string{"tmux", "attach-session", "-t", target}
+	} else {
+		argv = []string{"tmux", "new-session", "-s", "main"}
 	}
 
-	m.register(name, cred, u.HomeDir)
-	return &Client{mgr: m, name: name, ptmx: ptmx, cmd: cmd}, nil
+	ptmx, tty, err := pty.Open()
+	if err != nil {
+		return nil, err
+	}
+	_ = pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols})
+
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = u.HomeDir
+	cmd.Env = baseEnv(u)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Credential: cred}
+	if err := cmd.Start(); err != nil {
+		_ = ptmx.Close()
+		_ = tty.Close()
+		return nil, fmt.Errorf("attach tmux: %w", err)
+	}
+	clientTTY := tty.Name()
+	_ = tty.Close() // parent keeps only the master
+
+	// Best-effort: surface bells from any session to the attached client.
+	go func() { _ = m.tmuxAsUser(u, "set-option", "-g", "bell-action", "any").Run() }()
+
+	return &Client{mgr: m, user: u, ptmx: ptmx, cmd: cmd, tty: clientTTY}, nil
 }
 
-// Read returns terminal output bytes.
-func (c *Client) Read(p []byte) (int, error) { return c.ptmx.Read(p) }
+// Read/Write/Resize/Close operate on the PTY.
+func (c *Client) Read(p []byte) (int, error)  { return c.ptmx.Read(p) }
+func (c *Client) Write(p []byte) (int, error) { return c.ptmx.Write(p) }
 
-// Write forwards user input to the PTY and marks the session active (only real
-// user input refreshes the idle timer — output, resize and heartbeats do not).
-func (c *Client) Write(p []byte) (int, error) {
-	c.mgr.touch(c.name)
-	return c.ptmx.Write(p)
-}
-
-// Resize updates the PTY window size. Setting TIOCSWINSZ on the master does not
-// reliably deliver SIGWINCH to the attached tmux client on its own, so we signal
-// the client explicitly — without it tmux keeps the stale window size.
+// Resize updates the PTY size; TIOCSWINSZ alone doesn't reliably signal the
+// tmux client, so send SIGWINCH explicitly.
 func (c *Client) Resize(cols, rows uint16) error {
 	if err := pty.Setsize(c.ptmx, &pty.Winsize{Rows: rows, Cols: cols}); err != nil {
 		return err
@@ -147,10 +131,7 @@ func (c *Client) Resize(cols, rows uint16) error {
 	return nil
 }
 
-// Session returns the tmux session name.
-func (c *Client) Session() string { return c.name }
-
-// Close tears down this attach client without killing the persistent tmux session.
+// Close tears down this client; the tmux sessions live on.
 func (c *Client) Close() error {
 	_ = c.ptmx.Close()
 	if c.cmd.Process != nil {
@@ -160,89 +141,178 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func (m *Manager) register(name string, cred *syscall.Credential, home string) {
-	m.mu.Lock()
-	si := m.sessions[name]
-	if si == nil {
-		si = &sessInfo{name: name, cred: cred, home: home}
-		m.sessions[name] = si
+// Switch points this client at an existing session.
+func (c *Client) Switch(target string) error {
+	if !ValidName(target) {
+		return errBadName
 	}
-	si.lastInput = time.Now()
-	m.mu.Unlock()
+	return c.mgr.tmuxAsUser(c.user, "switch-client", "-c", c.tty, "-t", target).Run()
 }
 
-func (m *Manager) touch(name string) {
-	m.mu.Lock()
-	if si := m.sessions[name]; si != nil {
-		si.lastInput = time.Now()
+// NewBash creates a fresh local shell session and switches to it.
+func (c *Client) NewBash() (string, error) {
+	name := c.mgr.nextName(c.user)
+	if err := c.mgr.tmuxAsUser(c.user, "new-session", "-d", "-s", name).Run(); err != nil {
+		return "", err
 	}
-	m.mu.Unlock()
+	return name, c.Switch(name)
 }
 
-func (m *Manager) buildEnv(u *user.User, id, name string) []string {
-	env := []string{
-		"HOME=" + u.HomeDir,
-		"USER=" + u.Username,
-		"LOGNAME=" + u.Username,
-		"PATH=/usr/local/bin:/usr/bin:/bin",
-		"TERM=xterm-256color",
-		"LANG=en_US.UTF-8",
-		"WEBSH_SESSION=" + name,
-		"WEBSH_TAB_ID=" + id,
-		"WEBSH_NOTIFY_URL=" + m.notifyURL,
+// NewRemote opens another tmux session ON the remote and switches to it. It is
+// backed by a local proxy session named "<n>@<id>" whose command sshes to the
+// host and runs `tmux new-session -A -s <n>` there — so "0@server" is remote
+// tmux session "0". The remote sessions persist independently of websh.
+func (c *Client) NewRemote(spec Spec) (string, error) {
+	if !ValidName(spec.ID) {
+		return "", errBadName
 	}
-	if m.tokenFn != nil {
-		env = append(env, "WEBSH_NOTIFY_TOKEN="+m.tokenFn(name))
+	idx := strconv.Itoa(c.mgr.nextRemoteIndex(c.user, spec.ID))
+	name := idx + "@" + spec.ID // local proxy == display name
+	argv := []string{"new-session", "-d", "-s", name}
+	argv = append(argv, sshArgs(spec)...)
+	argv = append(argv, "tmux", "new-session", "-A", "-s", idx) // remote session name
+	if err := c.mgr.tmuxAsUser(c.user, argv...).Run(); err != nil {
+		return "", err
 	}
-	return env
+	return name, c.Switch(name)
 }
 
-// Janitor reclaims idle tmux sessions until stop is closed.
-func (m *Manager) Janitor(stop <-chan struct{}) {
-	t := time.NewTicker(time.Hour)
-	defer t.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-t.C:
-			m.reapIdle()
+// nextRemoteIndex returns the smallest free index n such that "<n>@<id>" is not
+// already a local (proxy) session.
+func (m *Manager) nextRemoteIndex(u *user.User, id string) int {
+	suffix := "@" + id
+	used := map[int]bool{}
+	for _, li := range m.List(u) {
+		if rest, ok := strings.CutSuffix(li.Name, suffix); ok {
+			if n, err := strconv.Atoi(rest); err == nil {
+				used[n] = true
+			}
+		}
+	}
+	for i := 0; ; i++ {
+		if !used[i] {
+			return i
 		}
 	}
 }
 
-func (m *Manager) reapIdle() {
-	now := time.Now()
-	m.mu.Lock()
-	var dead []*sessInfo
-	for name, si := range m.sessions {
-		if now.Sub(si.lastInput) > m.idleTTL {
-			dead = append(dead, si)
-			delete(m.sessions, name)
+// CurrentSession returns the name of the session this client is attached to.
+func (c *Client) CurrentSession() string {
+	out, err := c.mgr.tmuxAsUser(c.user, "display-message", "-c", c.tty, "-p", "#{session_name}").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// mostRecent returns the most-recently-attached session name (the one to land
+// on when (re)attaching), or "" if there are none.
+func (m *Manager) mostRecent(u *user.User) string {
+	out, err := m.tmuxAsUser(u, "list-sessions", "-F", "#{session_last_attached}|#{session_name}").Output()
+	if err != nil {
+		return ""
+	}
+	best, bestTs := "", int64(-1)
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		ts, name, ok := strings.Cut(line, "|")
+		if !ok {
+			continue
+		}
+		v, _ := strconv.ParseInt(ts, 10, 64)
+		if v > bestTs {
+			bestTs, best = v, name
 		}
 	}
-	m.mu.Unlock()
-	for _, si := range dead {
-		killSession(si)
+	return best
+}
+
+// LiveInfo describes one tmux session.
+type LiveInfo struct {
+	Name     string
+	Attached bool
+	Window   string
+}
+
+// List returns ALL tmux sessions for user u.
+func (m *Manager) List(u *user.User) []LiveInfo {
+	// tmux drops literal tabs in -F output; use '|'. Session names with '|' are
+	// rejected by ValidName, and the count never contains '|'.
+	out, err := m.tmuxAsUser(u, "list-sessions", "-F", "#{session_name}|#{session_attached}|#{window_name}").Output()
+	if err != nil {
+		return nil // no server / no sessions
+	}
+	var res []LiveInfo
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 3)
+		li := LiveInfo{Name: parts[0]}
+		if len(parts) > 1 {
+			li.Attached = parts[1] != "" && parts[1] != "0"
+		}
+		if len(parts) > 2 {
+			li.Window = parts[2]
+		}
+		res = append(res, li)
+	}
+	return res
+}
+
+// Rename renames a session.
+func (m *Manager) Rename(u *user.User, old, name string) error {
+	if !ValidName(old) || !ValidName(name) {
+		return errBadName
+	}
+	return m.tmuxAsUser(u, "rename-session", "-t", old, name).Run()
+}
+
+// Kill terminates a session.
+func (m *Manager) Kill(u *user.User, name string) error {
+	if !ValidName(name) {
+		return errBadName
+	}
+	return m.tmuxAsUser(u, "kill-session", "-t", name).Run()
+}
+
+// nextName returns the smallest unused "sh<N>" name.
+func (m *Manager) nextName(u *user.User) string {
+	used := map[string]bool{}
+	for _, li := range m.List(u) {
+		used[li.Name] = true
+	}
+	for i := 1; ; i++ {
+		n := "sh" + strconv.Itoa(i)
+		if !used[n] {
+			return n
+		}
 	}
 }
 
-func killSession(si *sessInfo) {
-	cmd := exec.Command("tmux", "kill-session", "-t", si.name)
-	cmd.Dir = si.home
-	cmd.Env = []string{"HOME=" + si.home, "PATH=/usr/local/bin:/usr/bin:/bin"}
-	if si.cred != nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: si.cred}
+// RenameRemote renames a session ON the remote (the prefix of "<n>@<id>").
+func (m *Manager) RenameRemote(u *user.User, spec Spec, old, name string) error {
+	if !ValidName(old) || !ValidName(name) {
+		return errBadName
 	}
-	_ = cmd.Run()
+	argv := sshExecArgs(spec, "tmux", "rename-session", "-t", old, name)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = u.HomeDir
+	cmd.Env = []string{"HOME=" + u.HomeDir, "PATH=/usr/local/bin:/usr/bin:/bin"}
+	if os.Geteuid() == 0 {
+		if uid, gid, groups, err := credentials(u); err == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: groups}}
+		}
+	}
+	return cmd.Run()
 }
 
-func buildArgv(spec Spec, name string) []string {
-	base := []string{"tmux", "new-session", "-A", "-s", name}
-	if !spec.SSH {
-		return base
-	}
-	ssh := []string{"ssh", "-tt"}
+// sshExecArgs builds a non-interactive ssh command (key auth only) running
+// remoteCmd on the remote host.
+func sshExecArgs(spec Spec, remoteCmd ...string) []string {
+	ssh := []string{"ssh", "-o", "BatchMode=yes"}
 	ssh = append(ssh, spec.SSHOptions...)
 	if spec.Port != 0 {
 		ssh = append(ssh, "-p", strconv.Itoa(spec.Port))
@@ -252,7 +322,44 @@ func buildArgv(spec Spec, name string) []string {
 		target = spec.User + "@" + spec.Host
 	}
 	ssh = append(ssh, target)
-	return append(base, ssh...)
+	return append(ssh, remoteCmd...)
+}
+
+func sshArgs(spec Spec) []string {
+	ssh := []string{"ssh", "-tt"}
+	ssh = append(ssh, spec.SSHOptions...)
+	if spec.Port != 0 {
+		ssh = append(ssh, "-p", strconv.Itoa(spec.Port))
+	}
+	target := spec.Host
+	if spec.User != "" {
+		target = spec.User + "@" + spec.Host
+	}
+	return append(ssh, target)
+}
+
+func baseEnv(u *user.User) []string {
+	return []string{
+		"HOME=" + u.HomeDir,
+		"USER=" + u.Username,
+		"LOGNAME=" + u.Username,
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+		"TERM=xterm-256color",
+		"LANG=en_US.UTF-8",
+	}
+}
+
+// tmuxAsUser builds a tmux command running as user u (privileges dropped when root).
+func (m *Manager) tmuxAsUser(u *user.User, args ...string) *exec.Cmd {
+	cmd := exec.Command("tmux", args...)
+	cmd.Dir = u.HomeDir
+	cmd.Env = []string{"HOME=" + u.HomeDir, "PATH=/usr/local/bin:/usr/bin:/bin"}
+	if os.Geteuid() == 0 {
+		if uid, gid, groups, err := credentials(u); err == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: groups}}
+		}
+	}
+	return cmd
 }
 
 func credentials(u *user.User) (uid, gid uint32, groups []uint32, err error) {
@@ -274,103 +381,4 @@ func credentials(u *user.User) (uid, gid uint32, groups []uint32, err error) {
 		}
 	}
 	return uint32(uid64), uint32(gid64), groups, nil
-}
-
-// tmuxAsUser builds a tmux command that runs as user u (privileges dropped when
-// the daemon is root).
-func (m *Manager) tmuxAsUser(u *user.User, args ...string) *exec.Cmd {
-	cmd := exec.Command("tmux", args...)
-	cmd.Dir = u.HomeDir
-	cmd.Env = []string{"HOME=" + u.HomeDir, "PATH=/usr/local/bin:/usr/bin:/bin"}
-	if os.Geteuid() == 0 {
-		if uid, gid, groups, err := credentials(u); err == nil {
-			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid, Groups: groups}}
-		}
-	}
-	return cmd
-}
-
-// LiveInfo describes one live websh tmux session.
-type LiveInfo struct {
-	ID       string
-	Label    string // user-set display name (@websh_label), may be empty
-	Attached bool
-}
-
-// List returns all live websh tmux sessions for user u.
-func (m *Manager) List(u *user.User) []LiveInfo {
-	uid, _, _, err := credentials(u)
-	if err != nil {
-		return nil
-	}
-	// tmux drops literal tabs in -F output, so use '|' as the separator. The
-	// label goes last (SplitN keeps the remainder) so a '|' inside a label is safe;
-	// session names and the attached count never contain '|'.
-	out, err := m.tmuxAsUser(u, "list-sessions", "-F", "#{session_name}|#{session_attached}|#{@websh_label}").Output()
-	if err != nil {
-		return nil // no server / no sessions
-	}
-	want := strconv.FormatUint(uint64(uid), 10)
-	var res []LiveInfo
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "|", 3)
-		su, slug, ok := ParseSessionName(parts[0])
-		if !ok || su != want {
-			continue
-		}
-		li := LiveInfo{ID: slug}
-		if len(parts) > 1 {
-			li.Attached = parts[1] != "" && parts[1] != "0"
-		}
-		if len(parts) > 2 {
-			li.Label = parts[2]
-		}
-		res = append(res, li)
-	}
-	return res
-}
-
-// LiveSessions returns the set of live session slugs for user u.
-func (m *Manager) LiveSessions(u *user.User) map[string]bool {
-	set := map[string]bool{}
-	for _, li := range m.List(u) {
-		set[li.ID] = true
-	}
-	return set
-}
-
-// SetLabel sets the display label (tmux @websh_label option) of a session.
-func (m *Manager) SetLabel(u *user.User, id, label string) error {
-	uid, _, _, err := credentials(u)
-	if err != nil {
-		return err
-	}
-	return m.tmuxAsUser(u, "set-option", "-t", SessionName(uid, id), "@websh_label", label).Run()
-}
-
-// Kill terminates a session and forgets it.
-func (m *Manager) Kill(u *user.User, id string) error {
-	uid, _, _, err := credentials(u)
-	if err != nil {
-		return err
-	}
-	name := SessionName(uid, id)
-	m.mu.Lock()
-	delete(m.sessions, name)
-	m.mu.Unlock()
-	return m.tmuxAsUser(u, "kill-session", "-t", name).Run()
-}
-
-// NextBashID returns the smallest positive integer id not currently in use.
-func (m *Manager) NextBashID(u *user.User) string {
-	used := m.LiveSessions(u)
-	for i := 1; ; i++ {
-		id := strconv.Itoa(i)
-		if !used[id] {
-			return id
-		}
-	}
 }

@@ -14,7 +14,7 @@
 :root{
   --bg:#0d1117; --bg2:#161b22; --bg3:#21262d; --line:#30363d;
   --fg:#e6edf3; --mut:#8b949e; --acc:#2f81f7; --ok:#3fb950; --err:#f85149;
-  --tabh:42px; --barh:46px;
+  --barh:46px;
 }
 *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
@@ -44,41 +44,13 @@ header{height:var(--barh);min-height:var(--barh);display:flex;align-items:center
   gap:8px;padding:0 10px;background:var(--bg2);border-bottom:1px solid var(--line);
   padding-top:env(safe-area-inset-top);}
 header .title{font-weight:600;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+header .title.editable:active{color:var(--acc);}
 header button{padding:6px 10px;font-size:13px;}
 
-/* ---- 会话列表 ---- */
-#sessions{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px;}
-.srv{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:14px;
-  display:flex;align-items:center;gap:12px;}
-.srv:active{border-color:var(--acc);}
-.srv .ic{font-size:22px;}
-.srv .meta{flex:1;min-width:0;}
-.srv .name{font-weight:600;font-size:15px;word-break:break-all;}
-.srv .desc{color:var(--mut);font-size:12px;margin-top:2px;}
-.srv .dot{width:8px;height:8px;border-radius:50%;background:var(--mut);}
-.srv .dot.live{background:var(--ok);}
-#notifyBar{margin:0 12px;}
-#notifyBar button{width:100%;border-color:var(--acc);color:var(--acc);}
-
-/* ---- 工作区 ---- */
+/* ---- 工作区（单终端）---- */
 #work{flex:1;display:flex;flex-direction:column;min-height:0;}
-.tabbar{display:flex;height:var(--tabh);min-height:var(--tabh);background:var(--bg2);
-  border-bottom:1px solid var(--line);overflow-x:auto;overflow-y:hidden;}
-.tabbar::-webkit-scrollbar{display:none;}
-.tab{display:flex;align-items:center;gap:6px;padding:0 14px;white-space:nowrap;
-  border-right:1px solid var(--line);color:var(--mut);font-size:13px;}
-.tab.active{color:var(--fg);background:var(--bg);box-shadow:inset 0 -2px 0 var(--acc);}
-.tab .tabx{margin-left:2px;color:var(--mut);font-size:16px;line-height:1;padding:2px 4px;border-radius:6px;}
-.tab .tabx:active{background:var(--err);color:#fff;}
-.tab .dot{width:7px;height:7px;border-radius:50%;background:var(--mut);}
-.tab .dot.on{background:var(--ok);}
-.tab .dot.err{background:var(--err);}
-.tab .dot.wait{background:#d29922;}
-
 .pane{flex:1;min-height:0;position:relative;}
 .view{position:absolute;inset:0;display:flex;flex-direction:column;}
-
-/* ---- 终端 ---- */
 .term-wrap{flex:1;min-height:0;background:#000;}
 .term-wrap .xterm{height:100%;padding:4px;}
 .termbar{display:flex;gap:6px;padding:6px;background:var(--bg2);
@@ -89,6 +61,23 @@ header button{padding:6px 10px;font-size:13px;}
 .cmdbar{display:flex;gap:6px;padding:6px;background:var(--bg2);border-top:1px solid var(--line);}
 .cmdbar input{font-family:ui-monospace,monospace;}
 
+/* ---- 会话抽屉 ---- */
+#drawer{position:fixed;inset:0;z-index:80;background:var(--bg);display:flex;flex-direction:column;
+  padding-top:env(safe-area-inset-top);}
+.drawerbar{display:flex;gap:8px;align-items:center;padding:10px;background:var(--bg2);
+  border-bottom:1px solid var(--line);}
+#notifyBar{margin:12px 12px 0;}
+#notifyBar button{width:100%;border-color:var(--acc);color:var(--acc);}
+#sessions{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px;}
+.srv{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:14px;
+  display:flex;align-items:center;gap:12px;}
+.srv:active{border-color:var(--acc);}
+.srv .ic{font-size:22px;}
+.srv .meta{flex:1;min-width:0;}
+.srv .name{font-weight:600;font-size:15px;word-break:break-all;}
+.srv .desc{color:var(--mut);font-size:12px;margin-top:2px;}
+.srv.cur{border-color:var(--acc);}
+
 .copyov{position:fixed;inset:0;z-index:90;background:var(--bg);display:flex;flex-direction:column;
   padding-top:env(safe-area-inset-top);}
 .copybar{display:flex;gap:8px;align-items:center;padding:10px;background:var(--bg2);
@@ -98,13 +87,9 @@ header button{padding:6px 10px;font-size:13px;}
   -webkit-user-select:text;user-select:text;}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
   background:var(--bg3);border:1px solid var(--line);border-radius:10px;
-  padding:10px 16px;font-size:13px;max-width:90%;z-index:50;opacity:0;
+  padding:10px 16px;font-size:13px;max-width:90%;z-index:95;opacity:0;
   transition:opacity .2s;pointer-events:none;}
 #toast.show{opacity:1;}
-#updateBar{position:fixed;left:0;right:0;top:0;z-index:100;
-  padding:calc(8px + env(safe-area-inset-top)) 10px 8px;background:transparent;}
-#updateBar button{width:100%;background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600;
-  box-shadow:0 2px 8px rgba(0,0,0,.4);}
 </style>
 </head>
 <body>
@@ -121,28 +106,29 @@ header button{padding:6px 10px;font-size:13px;}
     <div id="loginErr" class="err"></div>
   </section>
 
-  <!-- 会话列表 -->
-  <header id="srvHeader" class="hidden">
-    <span class="title grow">选择会话</span>
-    <button id="logoutBtn" class="ghost">退出</button>
-  </header>
-  <div id="notifyBar" class="hidden"><button id="notifyBtn">🔔 开启通知</button></div>
-  <section id="sessions" class="hidden"></section>
-
-  <!-- 工作区 -->
+  <!-- 工作区（单终端） -->
   <header id="workHeader" class="hidden">
-    <button id="backBtn" class="ghost">‹ 返回</button>
+    <button id="menuBtn" class="ghost">≡ 会话</button>
     <span class="title grow" id="workTitle"></span>
     <button id="fontDec" class="ghost">A-</button>
     <button id="fontInc" class="ghost">A+</button>
   </header>
   <section id="work" class="hidden">
-    <div class="tabbar" id="tabbar"></div>
     <div class="pane" id="pane"></div>
   </section>
 </div>
 
-<div id="updateBar" class="hidden"><button id="updateBtn">发现新版本 · 点击更新</button></div>
+<!-- 会话抽屉 -->
+<div id="drawer" class="hidden">
+  <div class="drawerbar">
+    <span class="title grow">会话</span>
+    <button id="drawerClose" class="ghost">✕ 关闭</button>
+    <button id="logoutBtn" class="ghost">退出</button>
+  </div>
+  <div id="notifyBar" class="hidden"><button id="notifyBtn">🔔 开启通知</button></div>
+  <section id="sessions"></section>
+</div>
+
 <div id="toast"></div>
 
 <script src="vendor/xterm.js"></script>

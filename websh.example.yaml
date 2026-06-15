@@ -15,7 +15,11 @@ display_name: "Wen Jun"
 # SSH quick-connects. Local shells are NOT configured here — create them in the
 # UI with "+ new bash". Each remote connects with this user's own ~/.ssh keys.
 remotes:
+  # Each remote can hold MANY sessions, shown as "0@<id>", "1@<id>", … (tmux
+  # session 0, 1, … on the remote). The id is the part after "@", so set a short
+  # id (e.g. "server") for a clean "0@server".
   - host: "gpu01.internal"     # required; the session id is derived from it
+    id: "gpu01"                # optional; the "@id" label (default = slugified host)
     name: "GPU 01"             # optional display name (defaults to host)
     user: "deploy"             # optional ssh login user
     port: 22                   # optional

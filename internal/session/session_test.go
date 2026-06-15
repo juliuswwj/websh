@@ -3,77 +3,34 @@ package session
 import (
 	"os/exec"
 	"os/user"
-	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
 func cleanEnv(home string) []string {
-	return []string{"HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "TERM=xterm-256color"}
+	return []string{"HOME=" + home, "PATH=/usr/local/bin:/usr/bin:/bin", "TERM=xterm-256color", "SHELL=/bin/bash"}
 }
 
-// TestSpawnPlumbing checks the PTY/tmux spawn path works (PTY allocated, resize
-// and close succeed) regardless of the login shell.
-func TestSpawnPlumbing(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed")
-	}
-	u, err := user.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
-	m := NewManager(time.Hour, "http://127.0.0.1:0/internal/notify", func(string) string { return "tok" })
-	spec := Spec{ID: "plumb"}
-	c, err := m.Spawn(spec, u, 80, 24)
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	defer killSession(&sessInfo{name: c.Session(), home: u.HomeDir})
-	if err := c.Resize(100, 30); err != nil {
-		t.Fatalf("Resize: %v", err)
-	}
-	if err := c.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-}
-
-// TestLiveSessionsAndReap validates session listing, name parsing and idle
-// reclamation against a shell-independent tmux session (runs `sleep`).
-func TestLiveSessionsAndReap(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed")
-	}
-	u, err := user.Current()
-	if err != nil {
-		t.Fatal(err)
-	}
-	uid64, _ := strconv.ParseUint(u.Uid, 10, 32)
-	name := SessionName(uint32(uid64), "live")
-
-	// Create a persistent session that does not depend on the login shell.
-	create := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep", "120")
-	create.Env = cleanEnv(u.HomeDir)
-	create.Dir = u.HomeDir
-	if out, err := create.CombinedOutput(); err != nil {
+// mkSession creates a detached tmux session that doesn't depend on the login
+// shell (runs `sleep`), and returns a cleanup func.
+func mkSession(t *testing.T, u *user.User, name string) func() {
+	t.Helper()
+	c := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep", "300")
+	c.Env = cleanEnv(u.HomeDir)
+	c.Dir = u.HomeDir
+	if out, err := c.CombinedOutput(); err != nil {
 		t.Skipf("cannot create tmux session here: %v: %s", err, out)
 	}
-	defer killSession(&sessInfo{name: name, home: u.HomeDir})
-
-	m := NewManager(time.Hour, "", nil)
-	if !m.LiveSessions(u)["live"] {
-		t.Fatal("LiveSessions did not find the live session")
-	}
-
-	// Register it and force idle reclamation.
-	m.register(name, nil, u.HomeDir)
-	m.idleTTL = 0
-	m.reapIdle()
-	if m.LiveSessions(u)["live"] {
-		t.Fatal("session should have been reclaimed by the janitor")
+	return func() {
+		k := exec.Command("tmux", "kill-session", "-t", name)
+		k.Env = cleanEnv(u.HomeDir)
+		_ = k.Run()
 	}
 }
 
-func TestListLabelRoundtrip(t *testing.T) {
+func requireTmux(t *testing.T) *user.User {
+	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed")
 	}
@@ -81,72 +38,217 @@ func TestListLabelRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	uid64, _ := strconv.ParseUint(u.Uid, 10, 32)
-	name := SessionName(uint32(uid64), "labeltest")
-	create := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep", "120")
-	create.Env = cleanEnv(u.HomeDir)
-	create.Dir = u.HomeDir
-	if out, err := create.CombinedOutput(); err != nil {
-		t.Skipf("cannot create tmux session: %v: %s", err, out)
-	}
-	defer killSession(&sessInfo{name: name, home: u.HomeDir})
+	return u
+}
 
-	m := NewManager(time.Hour, "", nil)
-	if err := m.SetLabel(u, "labeltest", "My Box | 1"); err != nil {
-		t.Fatalf("SetLabel: %v", err)
-	}
-	found := false
+// TestListAll proves websh lists ALL of the user's sessions, not just ones it
+// created — the core fix.
+func TestListAll(t *testing.T) {
+	u := requireTmux(t)
+	defer mkSession(t, u, "alpha")()
+	defer mkSession(t, u, "beta")()
+
+	m := NewManager()
+	got := map[string]bool{}
 	for _, li := range m.List(u) {
-		if li.ID == "labeltest" {
-			found = true
-			if li.Label != "My Box | 1" {
-				t.Fatalf("label = %q, want %q", li.Label, "My Box | 1")
+		got[li.Name] = true
+	}
+	if !got["alpha"] || !got["beta"] {
+		t.Fatalf("List did not include both plain sessions: %v", got)
+	}
+}
+
+// TestAttachSwitch attaches a top-level client and switches it between sessions.
+func TestAttachSwitch(t *testing.T) {
+	u := requireTmux(t)
+	defer mkSession(t, u, "alpha")()
+	defer mkSession(t, u, "beta")()
+
+	m := NewManager()
+	c, err := m.Attach(u, 80, 24)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer c.Close()
+	go func() {
+		b := make([]byte, 4096)
+		for {
+			if _, e := c.Read(b); e != nil {
+				return
 			}
 		}
+	}()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := c.Switch("beta"); err != nil {
+		t.Fatalf("Switch: %v", err)
 	}
-	if !found {
-		t.Fatal("labeltest session not listed")
+	if !waitClientSession(u, c.tty, "beta") {
+		t.Fatalf("client did not switch to beta (got %q)", clientSession(u, c.tty))
+	}
+	if err := c.Switch("alpha"); err != nil {
+		t.Fatalf("Switch: %v", err)
+	}
+	if !waitClientSession(u, c.tty, "alpha") {
+		t.Fatalf("client did not switch to alpha")
 	}
 }
 
-func TestNextBashID(t *testing.T) {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed")
-	}
-	u, err := user.Current()
+// TestNewBashAndKill creates a bash session, confirms the client lands on it,
+// then kills it.
+func TestNewBashAndKill(t *testing.T) {
+	u := requireTmux(t)
+	defer mkSession(t, u, "alpha")() // ensure a server + a fallback session
+
+	m := NewManager()
+	c, err := m.Attach(u, 80, 24)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Attach: %v", err)
 	}
-	m := NewManager(time.Hour, "", nil)
-	id := m.NextBashID(u)
-	if m.LiveSessions(u)[id] {
-		t.Fatalf("NextBashID returned an in-use id %q", id)
-	}
-	if n, err := strconv.Atoi(id); err != nil || n < 1 {
-		t.Fatalf("NextBashID should be a positive integer, got %q", id)
-	}
-}
+	defer c.Close()
+	go func() {
+		b := make([]byte, 4096)
+		for {
+			if _, e := c.Read(b); e != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond)
 
-func TestParseSessionName(t *testing.T) {
-	uid, slug, ok := ParseSessionName("websh-1004-my-tab")
-	if !ok || uid != "1004" || slug != "my-tab" {
-		t.Fatalf("got uid=%q slug=%q ok=%v", uid, slug, ok)
+	name, err := c.NewBash()
+	if err != nil {
+		t.Fatalf("NewBash: %v", err)
 	}
-	if _, _, ok := ParseSessionName("other-session"); ok {
-		t.Fatal("non-websh name should not parse")
+	if !waitClientSession(u, c.tty, name) {
+		t.Fatalf("client did not switch to new bash %q", name)
 	}
-}
-
-func TestBuildArgvSSH(t *testing.T) {
-	spec := Spec{ID: "x", SSH: true, Host: "h.example", User: "deploy", Port: 2222, SSHOptions: []string{"-o", "ServerAliveInterval=30"}}
-	argv := buildArgv(spec, "websh-1-x")
-	want := []string{"tmux", "new-session", "-A", "-s", "websh-1-x", "ssh", "-tt", "-o", "ServerAliveInterval=30", "-p", "2222", "deploy@h.example"}
-	if len(argv) != len(want) {
-		t.Fatalf("argv len %d != %d: %v", len(argv), len(want), argv)
+	if err := m.Kill(u, name); err != nil {
+		t.Fatalf("Kill: %v", err)
 	}
-	for i := range want {
-		if argv[i] != want[i] {
-			t.Fatalf("argv[%d]=%q want %q", i, argv[i], want[i])
+	for _, li := range m.List(u) {
+		if li.Name == name {
+			t.Fatalf("session %q still present after Kill", name)
 		}
 	}
+}
+
+// TestRename renames a session.
+func TestRename(t *testing.T) {
+	u := requireTmux(t)
+	cleanup := mkSession(t, u, "renA")
+	defer func() {
+		// the rename may have moved it; clean both names
+		k := exec.Command("tmux", "kill-session", "-t", "renB")
+		k.Env = cleanEnv(u.HomeDir)
+		_ = k.Run()
+		cleanup()
+	}()
+
+	m := NewManager()
+	if err := m.Rename(u, "renA", "renB"); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	got := map[string]bool{}
+	for _, li := range m.List(u) {
+		got[li.Name] = true
+	}
+	if got["renA"] || !got["renB"] {
+		t.Fatalf("rename not applied: %v", got)
+	}
+}
+
+// TestAttachDeterministic guards the refresh bug: repeated attaches must all
+// land on the SAME session, not hop across every session.
+func TestAttachDeterministic(t *testing.T) {
+	u := requireTmux(t)
+	defer mkSession(t, u, "d1")()
+	defer mkSession(t, u, "d2")()
+	defer mkSession(t, u, "d3")()
+	time.Sleep(200 * time.Millisecond)
+
+	m := NewManager()
+	var clients []*Client
+	defer func() {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	}()
+	first := ""
+	for i := 0; i < 3; i++ {
+		c, err := m.Attach(u, 80, 24)
+		if err != nil {
+			t.Fatalf("Attach %d: %v", i, err)
+		}
+		clients = append(clients, c)
+		go func(c *Client) {
+			b := make([]byte, 4096)
+			for {
+				if _, e := c.Read(b); e != nil {
+					return
+				}
+			}
+		}(c)
+		time.Sleep(250 * time.Millisecond)
+		got := c.CurrentSession()
+		if i == 0 {
+			first = got
+		} else if got != first {
+			t.Fatalf("attach %d landed on %q, want %q (sessions must not round-robin)", i, got, first)
+		}
+	}
+}
+
+// TestNextRemoteIndex checks remote sessions get distinct "<n>@<id>" names.
+func TestNextRemoteIndex(t *testing.T) {
+	u := requireTmux(t)
+	m := NewManager()
+	if got := m.nextRemoteIndex(u, "srv"); got != 0 {
+		t.Fatalf("first index = %d, want 0", got)
+	}
+	defer mkSession(t, u, "0@srv")()
+	if got := m.nextRemoteIndex(u, "srv"); got != 1 {
+		t.Fatalf("after 0@srv, index = %d, want 1", got)
+	}
+}
+
+func TestValidName(t *testing.T) {
+	for _, ok := range []string{"main", "sh1", "GPU 01", "工作", "a_b-c", "0@srv"} {
+		if !ValidName(ok) {
+			t.Errorf("ValidName(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "a.b", "a:b", "a|b", "x\ty", "@win"} {
+		if ValidName(bad) {
+			t.Errorf("ValidName(%q) = true, want false", bad)
+		}
+	}
+}
+
+func TestSSHArgs(t *testing.T) {
+	a := sshArgs(Spec{ID: "x", SSH: true, Host: "h.example", User: "deploy", Port: 2222, SSHOptions: []string{"-o", "ServerAliveInterval=30"}})
+	want := []string{"ssh", "-tt", "-o", "ServerAliveInterval=30", "-p", "2222", "deploy@h.example"}
+	if strings.Join(a, " ") != strings.Join(want, " ") {
+		t.Fatalf("sshArgs = %v, want %v", a, want)
+	}
+}
+
+// helpers ---------------------------------------------------------------------
+
+func clientSession(u *user.User, tty string) string {
+	c := exec.Command("tmux", "display-message", "-c", tty, "-p", "#{session_name}")
+	c.Env = cleanEnv(u.HomeDir)
+	out, _ := c.Output()
+	return strings.TrimSpace(string(out))
+}
+
+func waitClientSession(u *user.User, tty, want string) bool {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if clientSession(u, tty) == want {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }

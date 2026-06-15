@@ -1,10 +1,10 @@
 // Command websh-notify sends an attention notification to the websh daemon for
-// the current terminal session. It is meant to be called from shell scripts or
-// from claude-code's Notification hook (which delivers a JSON event on stdin).
+// the current user. It is meant to be called from shell scripts or from
+// claude-code's Notification hook (which delivers a JSON event on stdin).
 //
-// It reads WEBSH_SESSION, WEBSH_NOTIFY_TOKEN and WEBSH_NOTIFY_URL from the
-// environment (injected by websh when the shell was spawned). The daemon
-// decides whether to push (PWA backgrounded) or show in-page (foregrounded).
+// It reads ~/.cache/websh/notify ({url, token}, written by websh at login), so
+// it works in ANY of the user's shells. The daemon decides whether to push (PWA
+// backgrounded) or show in-page (foregrounded).
 //
 // Usage:
 //
@@ -20,6 +20,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -28,12 +30,14 @@ func main() {
 	from := flag.String("from", "", "source label (e.g. claude); also reads a JSON event on stdin")
 	flag.Parse()
 
-	session := os.Getenv("WEBSH_SESSION")
-	token := os.Getenv("WEBSH_NOTIFY_TOKEN")
-	url := os.Getenv("WEBSH_NOTIFY_URL")
-	if session == "" || url == "" {
-		fmt.Fprintln(os.Stderr, "websh-notify: not inside a websh session (WEBSH_SESSION/WEBSH_NOTIFY_URL unset)")
+	url, token := loadNotifyConfig()
+	if url == "" || token == "" {
+		fmt.Fprintln(os.Stderr, "websh-notify: not configured (no ~/.cache/websh/notify — log in via websh once)")
 		os.Exit(1)
+	}
+	uname := ""
+	if u, err := user.Current(); err == nil {
+		uname = u.Username
 	}
 
 	msg := strings.TrimSpace(strings.Join(flag.Args(), " "))
@@ -47,7 +51,7 @@ func main() {
 		msg = "[" + *from + "] " + msg
 	}
 
-	body, _ := json.Marshal(map[string]string{"session": session, "token": token, "message": msg})
+	body, _ := json.Marshal(map[string]string{"user": uname, "token": token, "message": msg})
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -60,6 +64,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "websh-notify: %s: %s\n", resp.Status, strings.TrimSpace(string(b)))
 		os.Exit(1)
 	}
+}
+
+// loadNotifyConfig reads {url, token} from ~/.cache/websh/notify (falling back
+// to the legacy environment variables).
+func loadNotifyConfig() (url, token string) {
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		if data, err := os.ReadFile(filepath.Join(home, ".cache", "websh", "notify")); err == nil {
+			var c struct{ URL, Token string }
+			if json.Unmarshal(data, &c) == nil {
+				url, token = c.URL, c.Token
+			}
+		}
+	}
+	if url == "" {
+		url = os.Getenv("WEBSH_NOTIFY_URL")
+	}
+	if token == "" {
+		token = os.Getenv("WEBSH_NOTIFY_TOKEN")
+	}
+	return url, token
 }
 
 // stdinMessage reads a message from stdin: either a claude-code Notification

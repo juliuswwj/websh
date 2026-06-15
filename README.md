@@ -14,9 +14,11 @@ the PTY/tmux itself and has no such dependency.
 
 ## Features
 
-- **tmux sessions** — create local bash sessions on the fly ("+"), or SSH to
-  configured remotes with your own `~/.ssh` keys. List, rename, and kill any
-  live session; sessions persist across disconnects and reconnect reattaches.
+- **All your tmux sessions, anywhere** — one websocket attaches a single
+  top-level tmux client; the app lists **every** tmux session you have (including
+  ones you started over plain SSH) and switches between them with
+  `tmux switch-client`. Create local bash sessions ("+"), open configured SSH
+  remotes, rename, and kill — all in one connection. Disconnects never lose work.
 - **Login** — local PAM account (username + password) plus a 6-digit TOTP
   (Google Authenticator compatible). No `~/.config/websh.yaml` → no login. Web
   sessions are persisted, so restarting the daemon doesn't force a re-login.
@@ -24,9 +26,10 @@ the PTY/tmux itself and has no such dependency.
   bell, or an explicit `websh-notify` call), websh sends a **Web Push** if the
   PWA is backgrounded/closed, or an in-page hint if it's in the foreground.
 - **PWA** — installable, offline app shell, in-app update prompt, and
-  auto-reconnecting websockets with backoff + heartbeat.
-- **Resource hygiene** — web login sessions expire after 7 days; tmux sessions
-  with no user input for 3 days are reclaimed automatically.
+  auto-reconnecting websocket with backoff + heartbeat.
+- **Your sessions are yours** — websh never auto-kills tmux sessions (they're
+  your work); remove them yourself from the list. Web login sessions expire
+  after 7 days.
 
 ## Build
 
@@ -47,7 +50,16 @@ On the original dev host `libpam0g-dev` wasn't installed system-wide and there
 was no root, so the dev package was extracted locally under `.builddeps/` and
 `build.sh` points cgo at it. It also forces the **system** gcc (`/usr/bin/gcc`)
 — a conda gcc on `PATH` has the wrong sysroot and fails to link libpam — and
-pins a Go toolchain. You don't need `build.sh` on a normal machine.
+uses a locally-installed Go SDK with `GOTOOLCHAIN=local` (the system `go` is too
+old and `~/go` is ephemeral, so the go.mod-driven toolchain fetch from go.dev
+kept re-running and timing out). Install the SDK once:
+
+```sh
+tar -C /opt/tools -xzf /opt/tools/download/go1.26.3.linux-amd64.tar.gz  # -> /opt/tools/go
+```
+
+You don't need `build.sh` on a normal machine. CI uses `actions/setup-go` +
+`GOTOOLCHAIN=local`, so it doesn't hit this.
 
 ## Releases
 
@@ -118,23 +130,31 @@ user's own `~/.ssh` keys.
 
 ## Using the terminal
 
-- **New bash** — tap **＋** (tab bar or session list). Each one is its own tmux
-  session with an auto-assigned numeric id.
-- **Switch / reattach** — the session list shows every live tmux session; tap to
-  (re)attach. The **‹ 返回** button returns to the list.
-- **Rename** — tap a session's ✎ in the list, or tap the title in the terminal
-  header. The label is stored on the tmux session, so it survives reconnects.
-- **Kill** — tap 🗑 in the list to terminate a session.
+There is one terminal view; tap **≡ 会话** to open the session drawer.
+
+- **Switch** — the drawer lists **all** your tmux sessions (bash and SSH, however
+  they were started); tap one to switch the client to it (`tmux switch-client`).
+- **New bash** — tap **➕ 新建 Bash** (auto-named `sh1`, `sh2`, …).
+- **SSH remote** — tap a configured remote to open a tmux session **on it**; each
+  tap opens another, shown as `0@server`, `1@server`, … (i.e. tmux session `0`,
+  `1`, … on `server`). They run on the remote and persist there independently, so
+  reconnecting (or `0@server` again) reattaches the remote session.
+- **Rename** — ✎ in the drawer, or tap the session name in the header. (tmux
+  names can't contain `.` `:` `|`.)
+- **Kill** — 🗑 in the drawer terminates a session.
 - **Char mode** quick keys include the tmux prefix **^B** (your session *is* a
   tmux session) and the readline cursor keys **^A**/**^E**.
 
 ## Updating an installed PWA
 
-The web UI is cached for offline use, so an installed PWA keeps the cached
-version until it updates. When you deploy a new build (rebuild, bump the cache
-version in `service-worker.js`, restart), the app shows a **「发现新版本 · 点击更新」**
-banner on next launch; tapping it activates the new version and reloads. The
-terminal isn't interrupted otherwise (tmux persists and reconnects).
+The service worker serves the app shell (`index.html`, `app.js`) **network-first**,
+so an installed PWA picks up a new build on the next reload while online — no
+cache-busting dance. Only the big immutable vendor assets (xterm.js, icons) are
+cached-first. The SW activates immediately when it changes (`skipWaiting` +
+`clients.claim`) and the page reloads once to apply it; offline, the cached shell
+is used. So after deploying: just reload. (One-time: an old cache-first SW from a
+previous build must be replaced once — reload a couple of times, or unregister it
+in DevTools, and it self-heals to network-first.)
 
 ## Notifications
 
@@ -143,8 +163,9 @@ Two triggers feed the same push/suppress decision:
 1. **Terminal bell** — websh scans PTY output for BEL (`0x07`). claude-code and
    most TUIs ring the bell when they want you; zero setup, generic message.
 2. **`websh-notify`** — call it from scripts or hooks for a specific message. It
-   reads `WEBSH_SESSION` / `WEBSH_NOTIFY_TOKEN` / `WEBSH_NOTIFY_URL` (injected
-   into the shell) and posts to the daemon's loopback-only endpoint.
+   reads `~/.cache/websh/notify` (the daemon URL + your token, written at login,
+   mode 0600) and posts to the daemon's loopback-only endpoint — so it works in
+   **any** of your shells, including sessions not created by websh.
 
    ```sh
    websh-notify "build finished"
@@ -167,12 +188,15 @@ Android Chrome works directly.
 
 ## How persistence/reconnect works
 
-Each terminal is a tmux session `websh-<uid>-<id>`. A websocket spawns a PTY
-running `tmux new-session -A -s <name>` (attach-or-create) as the user. If the
-websocket drops, that attach client dies but the tmux session lives on;
-reconnecting runs the same command and tmux repaints. The client auto-reconnects
-with exponential backoff, and on returning to the foreground or regaining
-network.
+One websocket runs **one** PTY = one top-level tmux client (`tmux attach`, or
+`new-session` if you have none) as the user, started via `pty.Open()` so websh
+knows the client's tty and can target it with `tmux switch-client -c <tty> -t
+<session>`. Switching/creating sessions is just a tmux command on that client —
+no new connection. If the websocket drops, the tmux sessions live on;
+reconnecting attaches a fresh client to your most-recent session and tmux
+repaints. The client auto-reconnects with exponential backoff, and on returning
+to the foreground or regaining network. Multiple devices each get their own
+client/tty and switch independently.
 
 The server heartbeats every `--ws-heartbeat` (default 15s) to keep idle
 connections alive through reverse-proxy idle timeouts — **set your proxy's
@@ -189,9 +213,9 @@ cmd/websh/           HTTP server, auth, ws, push, notify endpoints
 cmd/websh-notify/    CLI for scripts / claude-code hook
 internal/config/     ~/.config/websh.yaml load + validation
 internal/auth/       PAM, TOTP, web-session store + cookie
-internal/session/    PTY + tmux spawn (privilege drop), idle janitor
-internal/bridge/     PTY <-> websocket, heartbeat, BEL scan
-internal/presence/   foreground/background tracking + push decision
+internal/session/    single tmux client attach + switch/new/rename/kill (priv drop)
+internal/bridge/     PTY <-> websocket, control frames, heartbeat, BEL scan
+internal/presence/   per-user foreground/background tracking + push decision
 internal/push/       VAPID + subscription store + send
 static/              PWA: index.html, app.js, service-worker.js, manifest, xterm
 ```

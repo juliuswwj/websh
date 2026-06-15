@@ -1,7 +1,7 @@
-/* websh service worker: app-shell cache + Web Push */
+/* websh service worker: network-first app shell + Web Push */
 'use strict';
 
-const CACHE = 'websh-shell-v8';
+const CACHE = 'websh-shell-v10';
 // Scope-relative URLs (the SW is registered with the app's BASE scope).
 const SHELL = [
   './',
@@ -14,37 +14,45 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (e) => {
-  // Do NOT skipWaiting automatically: a new SW waits until the page asks to
-  // update (so the terminal isn't reloaded out from under the user).
+  // Take over immediately so cache-strategy / code updates land quickly.
+  self.skipWaiting();
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
-});
-
-self.addEventListener('message', (e) => {
-  if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('activate', (e) => {
   e.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
 
+function cachePut(req, resp) {
+  if (resp && resp.ok && resp.type === 'basic') {
+    const copy = resp.clone();
+    caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+  }
+}
+
 self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
-  const url = new URL(req.url);
-  // Never touch the API or websockets — always go to the network.
-  if (url.pathname.includes('/api/') || url.pathname.includes('/ws/') || url.pathname.endsWith('/service-worker.js')) return;
-  // Cache-first for the app shell / vendor assets; fall back to network.
+  const p = new URL(req.url).pathname;
+  // Never touch API / websockets / the SW itself.
+  if (p.includes('/api/') || p.endsWith('/ws') || p.includes('/ws/') || p.endsWith('/service-worker.js')) return;
+
+  // Immutable vendor assets + icons: cache-first (big, rarely change).
+  if (p.includes('/vendor/') || p.includes('/icons/')) {
+    e.respondWith(caches.match(req).then((hit) => hit || fetch(req).then((resp) => { cachePut(req, resp); return resp; })));
+    return;
+  }
+
+  // App shell (HTML, app.js, manifest): NETWORK-FIRST so a reload always gets the
+  // latest when online; fall back to cache only when offline. This is what makes
+  // F5 actually pick up a new app.js.
   e.respondWith(
-    caches.match(req).then((hit) => hit || fetch(req).then((resp) => {
-      if (resp && resp.ok && resp.type === 'basic') {
-        const copy = resp.clone();
-        caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
-      }
-      return resp;
-    }).catch(() => hit))
+    fetch(req).then((resp) => { cachePut(req, resp); return resp; })
+      .catch(() => caches.match(req).then((hit) => hit || caches.match('index.html')))
   );
 });
 
@@ -63,12 +71,9 @@ self.addEventListener('push', (e) => {
 
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
-  const tabId = e.notification.data && e.notification.data.tabId;
   e.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    for (const c of all) {
-      if ('focus' in c) { await c.focus(); if (tabId) c.postMessage({ tabId }); return; }
-    }
+    for (const c of all) { if ('focus' in c) { await c.focus(); return; } }
     await self.clients.openWindow((e.notification.data && e.notification.data.url) || './');
   })());
 });

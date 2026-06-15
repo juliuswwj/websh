@@ -45,6 +45,12 @@ type Bridge struct {
 	OnPresence func(state string)
 	// OnAttention is called (debounced) when the PTY emits a bell.
 	OnAttention func()
+	// OnSwitch switches the tmux client to target; returns the resulting session
+	// name (or "" on failure).
+	OnSwitch func(target string) string
+	// OnNew creates a session (kind "bash"|"remote", id for remotes) and switches
+	// to it; returns the new session name (or "" on failure).
+	OnNew func(kind, id string) string
 	// Heartbeat overrides the ping interval (keeps idle connections alive
 	// through reverse-proxy idle timeouts). Zero uses the default.
 	Heartbeat time.Duration
@@ -159,10 +165,13 @@ func (b *Bridge) readWS(ctx context.Context) {
 			continue
 		}
 		var m struct {
-			Type  string `json:"type"`
-			Cols  uint16 `json:"cols"`
-			Rows  uint16 `json:"rows"`
-			State string `json:"state"`
+			Type   string `json:"type"`
+			Cols   uint16 `json:"cols"`
+			Rows   uint16 `json:"rows"`
+			State  string `json:"state"`
+			Target string `json:"target"`
+			Kind   string `json:"kind"`
+			ID     string `json:"id"`
 		}
 		if json.Unmarshal(data, &m) != nil {
 			continue
@@ -176,10 +185,27 @@ func (b *Bridge) readWS(ctx context.Context) {
 			if b.OnPresence != nil {
 				b.OnPresence(m.State)
 			}
+		case "switch":
+			if b.OnSwitch != nil {
+				if name := b.OnSwitch(m.Target); name != "" {
+					b.sendSession(name)
+				}
+			}
+		case "new":
+			if b.OnNew != nil {
+				if name := b.OnNew(m.Kind, m.ID); name != "" {
+					b.sendSession(name)
+				}
+			}
 		case "pong", "ping":
 			// liveness only
 		}
 	}
+}
+
+func (b *Bridge) sendSession(name string) {
+	frame, _ := json.Marshal(map[string]string{"type": "session", "name": name})
+	b.Send(frame)
 }
 
 func (b *Bridge) bell() {
