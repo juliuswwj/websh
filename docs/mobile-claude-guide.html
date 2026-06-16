@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>用手机和 Claude 对话 · websh 使用说明</title>
+<style>
+  :root{
+    --bg:#f6f8fa; --card:#fff; --ink:#1f2328; --mut:#656d76; --line:#d0d7de;
+    --acc:#2f6feb; --acc-bg:#ddebff; --warn:#9a6700; --warn-bg:#fff8c5; --warn-line:#d4a72c;
+    --danger:#cf222e; --danger-bg:#ffebe9; --ok:#1a7f37; --code:#eaeef2;
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+    padding:env(safe-area-inset-top) 0 64px;}
+  .wrap{max-width:760px;margin:0 auto;padding:20px 16px;}
+  header.hero{background:linear-gradient(135deg,#1f6feb,#0b3a8c);color:#fff;border-radius:16px;
+    padding:24px 20px;margin-bottom:20px;}
+  header.hero h1{margin:0 0 6px;font-size:24px;}
+  header.hero p{margin:0;opacity:.9;font-size:14px;}
+  h2{font-size:20px;margin:32px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--line);}
+  h3{font-size:16px;margin:20px 0 6px;}
+  p{margin:8px 0;}
+  a{color:var(--acc);}
+  code{background:var(--code);padding:2px 6px;border-radius:6px;font-size:.9em;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;}
+  pre{background:#0d1117;color:#e6edf3;border-radius:12px;padding:14px 16px;overflow-x:auto;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13.5px;line-height:1.6;}
+  pre code{background:none;padding:0;color:inherit;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:14px 0;}
+  .callout{border-radius:14px;padding:14px 16px;margin:16px 0;border:1px solid;}
+  .callout .t{font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:8px;}
+  .danger{background:var(--danger-bg);border-color:#ff8182;color:#86061d;}
+  .warn{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn);}
+  .tip{background:var(--acc-bg);border-color:#79b8ff;color:#0b3a8c;}
+  .url{display:inline-block;background:#fff;border:1px dashed var(--acc);border-radius:10px;
+    padding:8px 12px;margin:6px 0;font-family:ui-monospace,monospace;font-size:14px;word-break:break-all;}
+  ol.steps{counter-reset:step;list-style:none;padding-left:0;margin:10px 0;}
+  ol.steps>li{position:relative;padding:4px 0 14px 40px;}
+  ol.steps>li::before{counter-increment:step;content:counter(step);position:absolute;left:0;top:2px;
+    width:26px;height:26px;border-radius:50%;background:var(--acc);color:#fff;font-size:14px;font-weight:700;
+    display:flex;align-items:center;justify-content:center;}
+  .kbd{display:inline-block;background:#fff;border:1px solid var(--line);border-bottom-width:2px;
+    border-radius:6px;padding:1px 7px;font-size:.85em;font-family:ui-monospace,monospace;}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14.5px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:#f0f3f6;}
+  .ico{font-size:1.1em;}
+  details{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px 14px;margin:10px 0;}
+  summary{font-weight:600;padding:10px 0;cursor:pointer;}
+  details[open] summary{border-bottom:1px solid var(--line);margin-bottom:8px;}
+  footer{color:var(--mut);font-size:13px;text-align:center;margin-top:40px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>📱 用手机和 Claude 对话</h1>
+    <p>websh 使用说明 · 面向不熟悉 Linux / x-workbench 的同学</p>
+  </header>
+
+  <p>websh 是一个装在手机浏览器里的<strong>终端 App</strong>。登录后你可以在手机上打开服务器里的
+  <strong>Claude（claude-code）</strong>会话，随时随地继续对话。会话跑在服务器的 tmux 里，
+  <strong>手机断网、息屏、切后台都不会丢</strong>——重新打开会自动接回原来的对话。</p>
+
+  <div class="callout danger">
+    <div class="t">🚫 最重要的一点：只能在「外网」访问</div>
+    <p style="margin:6px 0 0">下面这个网址<strong>只有在外网（公司内网访问不到）</strong>才能打开：</p>
+    <div class="url">https://ai.rainier.lango-tech.com/websh/</div>
+    <p style="margin:6px 0 0">所以在手机上请<strong>关闭公司 Wi-Fi、改用 4G/5G 流量</strong>（或其它外部网络）再打开。
+    如果用着公司内网怎么刷都打不开，<strong>这是正常的</strong>，不是坏了——切到流量即可。</p>
+  </div>
+
+  <h2>一、首次配置（在服务器上做一次）</h2>
+  <p>第一次使用前，需要在你的服务器账号里建一个配置文件。这一步要登录服务器操作一次，
+  之后手机端就一直能用了。<strong>如果你对命令行不熟，可以照抄下面的命令，或找运维/同事帮忙跑一遍。</strong></p>
+
+  <ol class="steps">
+    <li>
+      <h3>生成登录验证码（TOTP）</h3>
+      <p>SSH 登录服务器后，运行：</p>
+      <pre><code>websh config</code></pre>
+      <p>它会在终端里<strong>打印一个二维码</strong>。用手机上的<strong>身份验证器 App</strong>
+      （Google Authenticator、Microsoft Authenticator、1Password 等）扫这个码，
+      之后 App 里会每 30 秒刷新一个 6 位数字——这就是登录用的「动态验证码」。</p>
+    </li>
+    <li>
+      <h3>填入你的 x-workbench 账号，加上要用的服务器</h3>
+      <p>编辑配置文件 <code>~/.config/websh.yaml</code>（命令：<code>nano ~/.config/websh.yaml</code>），
+      在里面补上 <code>xwb:</code> 段和一台 <code>type: xwb</code> 的服务器。改成你自己的信息：</p>
+      <pre><code>otp_secret: "……"        # 上一步自动生成的，别动
+
+# 你的 x-workbench 账号（websh 用它登录 xwb 拿到令牌）
+xwb:
+  host: "172.60.1.35:9630"     # x-workbench 服务地址（按实际填写）
+  email: "you@lango-tech.com"  # 你的 x-workbench 邮箱
+  password: "你的密码"
+
+# 你要在上面跑 Claude 的服务器，用它在 x-workbench 里的 IP 标识
+remotes:
+  - type: xwb
+    ip: "10.0.0.5"             # 服务器在 x-workbench 里的 IP
+    name: "我的开发机"          # 随便起个好认的名字（可选）</code></pre>
+      <div class="callout tip">
+        <div class="t">💡 不知道 host / ip 填什么？</div>
+        <p style="margin:6px 0 0"><code>host</code> 是 x-workbench 的服务地址，<code>ip</code> 是你平时用的那台开发机
+        在 x-workbench 里的地址。如果不确定，问一下负责 x-workbench 的同事，或参照你 Web 版 x-workbench 里看到的服务器。
+        <code>server_id</code> / <code>credential_id</code> 这些 websh 会自动帮你查，不用填。</p>
+      </div>
+    </li>
+  </ol>
+
+  <h2>二、在手机上打开并登录</h2>
+  <ol class="steps">
+    <li>
+      <h3>切到外网，打开网址</h3>
+      <p>手机<strong>关 Wi-Fi 用流量</strong>，浏览器打开
+      <a href="https://ai.rainier.lango-tech.com/websh/">https://ai.rainier.lango-tech.com/websh/</a>。</p>
+    </li>
+    <li>
+      <h3>装到主屏幕（推荐）</h3>
+      <p>iPhone：Safari 点「分享 → 添加到主屏幕」；Android：Chrome 菜单「添加到主屏幕 / 安装应用」。
+      装成 App 后体验更好，而且<strong>开启消息通知必须先装到主屏幕</strong>。</p>
+    </li>
+    <li>
+      <h3>登录</h3>
+      <p>填三样：<strong>用户名</strong>（服务器账号）、<strong>密码</strong>（服务器账号密码）、
+      <strong>6 位验证码</strong>（身份验证器 App 里那串数字）。</p>
+    </li>
+  </ol>
+
+  <h2>三、打开 Claude 开始对话</h2>
+  <ol class="steps">
+    <li>点左上角 <span class="kbd">≡ 会话</span> 打开会话列表。</li>
+    <li>找到你配的那台服务器，点它的 <strong>＋ …… · Claude</strong> 按钮，开一个 Claude 会话。
+      （旁边的 <strong>＋ …… · Bash</strong> 是普通命令行终端。）</li>
+    <li>等它连上后，就能像在电脑上一样和 <strong>claude-code</strong> 对话了。</li>
+  </ol>
+
+  <div class="card">
+    <h3>怎么打字、怎么发送</h3>
+    <p>底部有两种输入方式，点最左边的按钮切换：</p>
+    <ul>
+      <li><span class="kbd">✍️ 整句</span>：在底部输入框里打整句，点「发送」或回车，一次性发给 Claude。<strong>推荐</strong>。</li>
+      <li><span class="kbd">⌨️ 单字</span>：调出手机软键盘逐字输入，适合需要按方向键、Esc、Ctrl 组合键的场景
+        （上面一排有 Esc / Tab / ^C 等快捷键）。</li>
+    </ul>
+    <p><strong>回车即发送</strong>：直接按回车就会把当前内容提交给 Claude（不会变成换行）。</p>
+  </div>
+
+  <div class="card">
+    <h3>手势操作（直接在终端画面上）</h3>
+    <table>
+      <tr><th>手势</th><th>作用</th></tr>
+      <tr><td>单指<strong>上下滑</strong></td><td>像滚轮一样翻看历史输出</td></tr>
+      <tr><td>单指<strong>左右滑</strong></td><td>切换到上一个 / 下一个会话</td></tr>
+      <tr><td><strong>长按后拖动</strong></td><td>框选一段文字（松手即复制，需 HTTPS）</td></tr>
+      <tr><td>翻到历史后<strong>轻点</strong></td><td>回到最新位置</td></tr>
+      <tr><td>两指捏合</td><td>放大/缩小字号</td></tr>
+    </table>
+    <p>底部按钮：<span class="ico">📋</span> 复制面板 ·
+      <span class="ico">📄</span> 复制整屏 ·
+      <span class="ico">📥</span> 粘贴（手机版的 Ctrl+Shift+V）·
+      <span class="ico">🧹</span> 清屏 ·
+      <span class="ico">🔄</span> 重连。</p>
+  </div>
+
+  <h2>四、开启消息通知（强烈推荐）</h2>
+  <p>Claude 跑完一段、需要你确认或回复时会「响铃」。开启通知后，<strong>即使你切到别的 App 或锁屏，
+  手机也会弹推送提醒你</strong>，不用一直盯着。</p>
+  <ol class="steps">
+    <li>确保已经<strong>装到主屏幕</strong>并从主屏幕图标打开（直接在浏览器里开不行）。</li>
+    <li>打开 <span class="kbd">≡ 会话</span> 抽屉，点 <strong>🔔 开启通知</strong>，允许权限即可。</li>
+  </ol>
+  <div class="callout warn">
+    <div class="t">⚠️ iPhone 用户注意</div>
+    <p style="margin:6px 0 0">iOS 需要 <strong>16.4 以上系统</strong>，并且必须<strong>先「添加到主屏幕」、再从那个图标进去开启通知</strong>，
+    在 Safari 里直接开是不行的。Android Chrome 没有这个限制。</p>
+  </div>
+
+  <h2>常见问题</h2>
+
+  <details>
+    <summary>网址怎么都打不开 / 一直转圈</summary>
+    <p>八成是连着公司内网。<strong>关掉 Wi-Fi、用手机流量</strong>再试——这个地址只对外网开放。</p>
+  </details>
+  <details>
+    <summary>登录失败 / 验证码不对</summary>
+    <p>验证码每 30 秒变一次，看准当前那一组再输；用户名密码是<strong>服务器账号</strong>的，不是 x-workbench 的。
+    如果手机时间不准也会导致验证码对不上，确认手机用「自动设置时间」。</p>
+  </details>
+  <details>
+    <summary>会话列表里没有 Claude 按钮</summary>
+    <p>说明 <code>~/.config/websh.yaml</code> 里还没配 <code>xwb:</code> 段或没加 <code>type: xwb</code> 的服务器。
+    回到「一、首次配置」第 2 步检查。</p>
+  </details>
+  <details>
+    <summary>打开 Claude 时报错（连不上 / 找不到服务器）</summary>
+    <p>多半是 <code>host</code>、<code>ip</code> 或 x-workbench 邮箱/密码填错了，或者那台服务器在 x-workbench 里
+    用的不是这个 IP。核对配置，必要时找 x-workbench 管理员确认地址。</p>
+  </details>
+  <details>
+    <summary>中途断网了会不会丢对话？</summary>
+    <p>不会。Claude 在服务器上继续跑，websh 会自动重连，回来后接着看。这正是用 websh 的好处。</p>
+  </details>
+  <details>
+    <summary>怎么把 Claude 的回答复制出来？</summary>
+    <p><strong>长按拖动</strong>框选要的文字（松手即复制）；或点 <span class="ico">📄</span> 复制整屏、
+    <span class="ico">📋</span> 打开复制面板手动选。复制到剪贴板需要 HTTPS，本站已是 HTTPS，没问题。</p>
+  </details>
+
+  <footer>
+    websh · 用手机随时随地和 Claude 协作　|　遇到问题可联系部署/运维同学
+  </footer>
+
+</div>
+</body>
+</html>
