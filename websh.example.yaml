@@ -12,8 +12,18 @@ otp_secret: "JBSWY3DPEHPK3PXP"
 # Optional display name.
 display_name: "Wen Jun"
 
-# SSH quick-connects. Local shells are NOT configured here — create them in the
-# UI with "+ new bash". Each remote connects with this user's own ~/.ssh keys.
+# Optional x-workbench (xwb) account. Required only if you add `type: xwb`
+# remotes below. The email/password log in to x-workbench to obtain a JWT
+# (cached under ~/.cache/websh/); the websocket to xwb is unstable, so websh
+# reconnects automatically.
+# xwb:
+#   host: "172.60.1.35:9630"      # upstream x-workbench host:port
+#   email: "you@lango-tech.com"
+#   password: "••••••"
+
+# Quick-connects. Local shells are NOT configured here — create them in the UI
+# with "+ new bash". ssh remotes connect with this user's own ~/.ssh keys; xwb
+# remotes connect through the xwb account above.
 remotes:
   # Each remote can hold MANY sessions, shown as "0@<id>", "1@<id>", … (tmux
   # session 0, 1, … on the remote). The id is the part after "@", so set a short
@@ -32,3 +42,12 @@ remotes:
   # - id: db-ro
   #   host: "db.internal"
   #   user: "readonly"
+
+  # An x-workbench server. Name it by its IP within xwb; server_id and
+  # credential_id are resolved at runtime via the xwb API. Each such server
+  # offers both a Bash and a Claude tab in the picker.
+  # - type: xwb
+  #   ip: "10.0.0.5"             # required; the server's IP inside x-workbench
+  #   id: "gpu5"                 # optional; the "@id" label (default = slugified ip)
+  #   name: "GPU 5"             # optional display name (defaults to ip)
+  #   credential_id: 219         # optional; default = auto-resolved (default/verified/first)

@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,6 +40,7 @@ import (
 	"websh/internal/presence"
 	"websh/internal/push"
 	"websh/internal/session"
+	"websh/internal/xwb"
 )
 
 type server struct {
@@ -60,6 +62,10 @@ func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "config" {
 		runConfig(args[1:])
+		return
+	}
+	if len(args) > 0 && args[0] == "xwb-proxy" {
+		runXWBProxy(args[1:])
 		return
 	}
 	if len(args) > 0 && args[0] == "serve" {
@@ -297,22 +303,36 @@ func (s *server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	remoteByName := map[string]bool{}
+	remoteType := map[string]string{}
 	for _, rmt := range cfg.Remotes {
-		remoteByName[rmt.ID] = true
+		remoteType[rmt.ID] = rmt.Type
 	}
 	live := make([]map[string]any, 0)
 	for _, li := range s.mgr.List(u) {
 		typ := "bash"
-		// "<n>@<remoteid>" is a session on a configured SSH remote.
-		if at := strings.LastIndex(li.Name, "@"); at >= 0 && remoteByName[li.Name[at+1:]] {
-			typ = "ssh"
+		entry := map[string]any{"name": li.Name, "attached": li.Attached, "window": li.Window}
+		// "<n>@<remoteid>" is a session on a configured remote (ssh or xwb).
+		if at := strings.LastIndex(li.Name, "@"); at >= 0 {
+			switch remoteType[li.Name[at+1:]] {
+			case "ssh":
+				typ = "ssh"
+			case "xwb":
+				typ = "xwb"
+				if k := s.mgr.XWBKind(u, li.Name); k != "" {
+					entry["xwb_kind"] = k // "bash" | "claude"
+				}
+			}
 		}
-		live = append(live, map[string]any{"name": li.Name, "type": typ, "attached": li.Attached, "window": li.Window})
+		entry["type"] = typ
+		live = append(live, entry)
 	}
 	remotes := make([]map[string]any, 0, len(cfg.Remotes))
 	for _, rmt := range cfg.Remotes {
-		remotes = append(remotes, map[string]any{"id": rmt.ID, "name": rmt.Name, "host": rmt.Host})
+		addr := rmt.Host
+		if rmt.IsXWB() {
+			addr = rmt.IP
+		}
+		remotes = append(remotes, map[string]any{"id": rmt.ID, "name": rmt.Name, "host": addr, "type": rmt.Type})
 	}
 	writeJSON(w, map[string]any{"user": sess.User, "display_name": cfg.DisplayName, "live": live, "remotes": remotes})
 }
@@ -337,10 +357,14 @@ func (s *server) handleRename(w http.ResponseWriter, r *http.Request) {
 	}
 	if plan.remote {
 		rmt, _ := cfg.FindRemote(plan.remoteID)
-		spec := session.Spec{ID: rmt.ID, SSH: true, Host: rmt.Host, User: rmt.User, Port: rmt.Port, SSHOptions: rmt.SSHOptions}
-		if err := s.mgr.RenameRemote(u, spec, plan.oldPrefix, plan.newPrefix); err != nil {
-			httpErr(w, http.StatusBadRequest, "重命名远端会话失败（远端不可达？）")
-			return
+		// xwb sessions have no remote-side tmux to rename; only the local proxy
+		// (renamed below). ssh sessions rename the remote tmux session too.
+		if !rmt.IsXWB() {
+			spec := session.Spec{ID: rmt.ID, SSH: true, Host: rmt.Host, User: rmt.User, Port: rmt.Port, SSHOptions: rmt.SSHOptions}
+			if err := s.mgr.RenameRemote(u, spec, plan.oldPrefix, plan.newPrefix); err != nil {
+				httpErr(w, http.StatusBadRequest, "重命名远端会话失败（远端不可达？）")
+				return
+			}
 		}
 	}
 	if err := s.mgr.Rename(u, req.Target, plan.newName); err != nil {
@@ -384,7 +408,7 @@ func planRename(target, rawName string, isRemote func(string) bool) (renamePlan,
 
 // handleKill terminates a tmux session.
 func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
-	_, _, u, ok := s.sessionUser(w, r)
+	_, cfg, u, ok := s.sessionUser(w, r)
 	if !ok {
 		return
 	}
@@ -393,9 +417,27 @@ func (s *server) handleKill(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusBadRequest, "invalid request")
 		return
 	}
+	// Capture xwb tab info BEFORE killing (the session is gone afterwards).
+	var xwbRemoteID, xwbTabID, xwbKind string
+	if at := strings.LastIndex(req.Target, "@"); at >= 0 {
+		if rmt, ok := cfg.FindRemote(req.Target[at+1:]); ok && rmt.IsXWB() {
+			xwbRemoteID = rmt.ID
+			xwbTabID = s.mgr.XWBTabID(u, req.Target)
+			xwbKind = s.mgr.XWBKind(u, req.Target)
+		}
+	}
 	if err := s.mgr.Kill(u, req.Target); err != nil {
 		httpErr(w, http.StatusBadRequest, "删除失败")
 		return
+	}
+	if xwbRemoteID != "" && xwbTabID != "" {
+		s.mgr.XWBTabRemove(u, xwbRemoteID, xwbTabID)
+		// claude tabs are persisted upstream; remove there too (best-effort).
+		if xwbKind == "claude" && cfg.XWB != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = xwbClientFor(cfg, u).DeleteClaude(ctx, xwbTabID)
+		}
 	}
 	writeJSON(w, map[string]any{"ok": true})
 }
@@ -413,6 +455,52 @@ func (s *server) sessionUser(w http.ResponseWriter, r *http.Request) (*auth.Sess
 		return nil, nil, nil, false
 	}
 	return sess, cfg, u, true
+}
+
+// ---- x-workbench -----------------------------------------------------------
+
+// xwbClientFor builds an xwb API client for a user. When running as root it
+// chowns the JWT cache to the user so the user's xwb-proxy can read/refresh it.
+func xwbClientFor(cfg *config.Config, u *user.User) *xwb.Client {
+	var owner *xwb.Owner
+	if os.Geteuid() == 0 {
+		if uid, err := strconv.Atoi(u.Uid); err == nil {
+			gid, _ := strconv.Atoi(u.Gid)
+			owner = &xwb.Owner{UID: uid, GID: gid}
+		}
+	}
+	return xwb.New(xwb.Creds{Host: cfg.XWB.Host, Email: cfg.XWB.Email, Password: cfg.XWB.Password}, u.HomeDir, owner)
+}
+
+// newXWBSession resolves the xwb server/credential for a remote (and, for claude,
+// starts the upstream tab) then opens the local proxy session.
+func newXWBSession(cfg *config.Config, u *user.User, client *session.Client, rmt config.Remote, xwbKind string) (string, error) {
+	if cfg.XWB == nil {
+		return "", errors.New("xwb not configured")
+	}
+	if xwbKind != "claude" {
+		xwbKind = "bash"
+	}
+	xc := xwbClientFor(cfg, u)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	serverID, err := xc.ResolveServer(ctx, rmt.IP)
+	if err != nil {
+		return "", err
+	}
+	credID, err := xc.ResolveCredential(ctx, serverID, rmt.CredentialID)
+	if err != nil {
+		return "", err
+	}
+	spec := session.WorkbenchSpec{ID: rmt.ID, Kind: xwbKind, ServerID: serverID, CredentialID: credID}
+	if xwbKind == "claude" {
+		tabID, err := xc.StartClaudeTab(ctx, serverID, credID)
+		if err != nil {
+			return "", err
+		}
+		spec.TabID = tabID
+	}
+	return client.NewWorkbench(spec)
 }
 
 // ---- terminal websocket ----------------------------------------------------
@@ -471,7 +559,7 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		return target
 	}
-	b.OnNew = func(kind, id string) string {
+	b.OnNew = func(kind, id, xwbKind string) string {
 		var name string
 		var err error
 		if kind == "remote" {
@@ -479,12 +567,16 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return ""
 			}
-			name, err = client.NewRemote(session.Spec{ID: rmt.ID, SSH: true, Host: rmt.Host, User: rmt.User, Port: rmt.Port, SSHOptions: rmt.SSHOptions})
+			if rmt.IsXWB() {
+				name, err = newXWBSession(cfg, u, client, rmt, xwbKind)
+			} else {
+				name, err = client.NewRemote(session.Spec{ID: rmt.ID, SSH: true, Host: rmt.Host, User: rmt.User, Port: rmt.Port, SSHOptions: rmt.SSHOptions})
+			}
 		} else {
 			name, err = client.NewBash()
 		}
 		if err != nil {
-			log.Printf("ws: new(%s,%q) user=%s: %v", kind, id, sess.User, err)
+			log.Printf("ws: new(%s,%q,%q) user=%s: %v", kind, id, xwbKind, sess.User, err)
 			return ""
 		}
 		return name

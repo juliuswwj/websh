@@ -155,3 +155,50 @@ func TestBridgeInputAndResize(t *testing.T) {
 		t.Fatalf("PTY received %q, want %q", written, "echo hi\r")
 	}
 }
+
+// TestBridgeNewXWB verifies a {type:"new"} frame forwards kind, id and the xwb
+// sub-kind to OnNew, and the bridge replies with the new session name.
+func TestBridgeNewXWB(t *testing.T) {
+	fp := newFakePTY()
+	type call struct{ kind, id, xwb string }
+	got := make(chan call, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		b := New(c, fp)
+		b.OnNew = func(kind, id, xwbKind string) string { got <- call{kind, id, xwbKind}; return "0@gpu" }
+		b.Run(r.Context())
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+
+	if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"new","kind":"remote","id":"gpu","xwb":"claude"}`)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case g := <-got:
+		if g.kind != "remote" || g.id != "gpu" || g.xwb != "claude" {
+			t.Fatalf("OnNew got %+v", g)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnNew not called")
+	}
+	for {
+		typ, data, err := c.Read(ctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if typ == websocket.MessageText && strings.Contains(string(data), `"0@gpu"`) {
+			return
+		}
+	}
+}

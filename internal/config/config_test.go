@@ -112,3 +112,102 @@ remotes:
 		t.Fatal("expected duplicate derived id to be rejected")
 	}
 }
+
+func TestXWBValid(t *testing.T) {
+	p := writeCfg(t, `
+otp_secret: "JBSWY3DPEHPK3PXP"
+xwb:
+  host: "172.60.1.35:9630"
+  email: "you@example.com"
+  password: "secret"
+remotes:
+  - type: xwb
+    ip: "10.0.0.5"
+  - type: xwb
+    ip: "10.0.0.6"
+    id: gpu6
+    name: "GPU 6"
+    credential_id: 219
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// id defaults to slugified ip; name defaults to ip.
+	r, ok := cfg.FindRemote("10_0_0_5")
+	if !ok {
+		t.Fatalf("FindRemote(10_0_0_5) failed; ids: %+v", cfg.Remotes)
+	}
+	if !r.IsXWB() || r.Name != "10.0.0.5" {
+		t.Fatalf("xwb remote defaults wrong: %+v", r)
+	}
+	r6, ok := cfg.FindRemote("gpu6")
+	if !ok || r6.CredentialID != 219 || r6.Name != "GPU 6" {
+		t.Fatalf("explicit xwb remote wrong: %+v", r6)
+	}
+}
+
+func TestXWBRequiresSection(t *testing.T) {
+	p := writeCfg(t, `
+otp_secret: "JBSWY3DPEHPK3PXP"
+remotes:
+  - type: xwb
+    ip: "10.0.0.5"
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected xwb remote without xwb: section to be rejected")
+	}
+}
+
+func TestXWBSectionRequiresCreds(t *testing.T) {
+	p := writeCfg(t, `
+otp_secret: "JBSWY3DPEHPK3PXP"
+xwb:
+  host: "172.60.1.35:9630"
+  email: ""
+  password: "x"
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected xwb section without email to be rejected")
+	}
+}
+
+func TestRejectCrossTypeFields(t *testing.T) {
+	// ssh remote must not carry xwb-only fields.
+	p := writeCfg(t, `
+otp_secret: "JBSWY3DPEHPK3PXP"
+remotes:
+  - host: "h.internal"
+    ip: "10.0.0.9"
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected ip on an ssh remote to be rejected")
+	}
+	// xwb remote must not carry ssh-only fields.
+	p2 := writeCfg(t, `
+otp_secret: "JBSWY3DPEHPK3PXP"
+xwb:
+  host: "172.60.1.35:9630"
+  email: "you@example.com"
+  password: "secret"
+remotes:
+  - type: xwb
+    ip: "10.0.0.5"
+    user: "deploy"
+`)
+	if _, err := Load(p2); err == nil {
+		t.Fatal("expected ssh user on an xwb remote to be rejected")
+	}
+}
+
+func TestUnknownTypeRejected(t *testing.T) {
+	p := writeCfg(t, `
+otp_secret: "JBSWY3DPEHPK3PXP"
+remotes:
+  - type: telnet
+    host: "h"
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected unknown remote type to be rejected")
+	}
+}
