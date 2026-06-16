@@ -8,6 +8,8 @@
 package session
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -84,9 +86,12 @@ func (m *Manager) Attach(u *user.User, cols, rows uint16) (*Client, error) {
 	// hop across every session. Picking an explicit target makes it deterministic
 	// — always the most-recently-active session, i.e. where you left off.
 	var argv []string
+	var landed string
 	if target := m.mostRecent(u); target != "" {
+		landed = target
 		argv = []string{"tmux", "attach-session", "-t", target}
 	} else {
+		landed = "main"
 		argv = []string{"tmux", "new-session", "-s", "main"}
 	}
 
@@ -109,10 +114,27 @@ func (m *Manager) Attach(u *user.User, cols, rows uint16) (*Client, error) {
 	clientTTY := tty.Name()
 	_ = tty.Close() // parent keeps only the master
 
-	// Best-effort: surface bells from any session to the attached client.
+	// Best-effort: surface bells from any session to the attached client, let
+	// tmux push copy-mode selections to the client clipboard (OSC 52), and enable
+	// mouse mode on the session we land on so the mobile client's touch gestures
+	// (wheel scroll, drag select) work.
 	go func() { _ = m.tmuxAsUser(u, "set-option", "-g", "bell-action", "any").Run() }()
+	go func() { _ = m.tmuxAsUser(u, "set-option", "-ga", "terminal-features", ",*:clipboard").Run() }()
+	go func() { m.enableMouse(u, landed) }()
 
 	return &Client{mgr: m, user: u, ptmx: ptmx, cmd: cmd, tty: clientTTY}, nil
+}
+
+// enableMouse turns on tmux mouse mode (and clipboard) for one session so the
+// mobile client's touch gestures map to wheel scroll / drag selection. Scoped to
+// the session (not -g) so it does not change the user's other tmux sessions.
+// Best-effort: ignored if the session is gone or the option is unsupported.
+func (m *Manager) enableMouse(u *user.User, name string) {
+	if !ValidName(name) {
+		return
+	}
+	_ = m.tmuxAsUser(u, "set-option", "-t", name, "mouse", "on").Run()
+	_ = m.tmuxAsUser(u, "set-option", "-t", name, "set-clipboard", "on").Run()
 }
 
 // Read/Write/Resize/Close operate on the PTY.
@@ -146,7 +168,11 @@ func (c *Client) Switch(target string) error {
 	if !ValidName(target) {
 		return errBadName
 	}
-	return c.mgr.tmuxAsUser(c.user, "switch-client", "-c", c.tty, "-t", target).Run()
+	if err := c.mgr.tmuxAsUser(c.user, "switch-client", "-c", c.tty, "-t", target).Run(); err != nil {
+		return err
+	}
+	c.mgr.enableMouse(c.user, target)
+	return nil
 }
 
 // NewBash creates a fresh local shell session and switches to it.
@@ -175,6 +201,94 @@ func (c *Client) NewRemote(spec Spec) (string, error) {
 		return "", err
 	}
 	return name, c.Switch(name)
+}
+
+// WorkbenchSpec describes an x-workbench tab to open. server_id/credential_id are
+// resolved by the caller (the daemon) before this is built; TabID is the upstream
+// claude tab_id for kind "claude", and empty for "bash" (a fresh one is minted).
+type WorkbenchSpec struct {
+	ID           string // remote id (the "@<id>" suffix)
+	Kind         string // "bash" | "claude"
+	ServerID     int
+	CredentialID int
+	TabID        string
+}
+
+// NewWorkbench opens an x-workbench tab as a local proxy session "<n>@<id>" whose
+// pane runs `websh xwb-proxy …` (the websocket bridge), and switches to it. It
+// mirrors NewRemote, but the pane runs the xwb bridge instead of ssh. The minted
+// (bash) / supplied (claude) tab_id is persisted so the shell can be re-attached.
+func (c *Client) NewWorkbench(spec WorkbenchSpec) (string, error) {
+	if !ValidName(spec.ID) {
+		return "", errBadName
+	}
+	if spec.Kind != "bash" && spec.Kind != "claude" {
+		return "", fmt.Errorf("invalid xwb kind %q", spec.Kind)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate websh binary: %w", err)
+	}
+	tabID := spec.TabID
+	if spec.Kind == "bash" && tabID == "" {
+		tabID = "mob-bash-" + randHex(6)
+	}
+	if tabID == "" {
+		return "", errors.New("xwb claude tab requires a tab_id")
+	}
+
+	idx := strconv.Itoa(c.mgr.nextRemoteIndex(c.user, spec.ID))
+	name := idx + "@" + spec.ID // local proxy == display name
+
+	argv := []string{"new-session", "-d", "-s", name, self, "xwb-proxy",
+		"--kind", spec.Kind, "--server-id", strconv.Itoa(spec.ServerID), "--tab-id", tabID}
+	if spec.Kind == "bash" && spec.CredentialID != 0 {
+		argv = append(argv, "--credential-id", strconv.Itoa(spec.CredentialID))
+	}
+	if err := c.mgr.tmuxAsUser(c.user, argv...).Run(); err != nil {
+		return "", err
+	}
+
+	// Tag the live session so it is self-describing, and persist for re-attach.
+	_ = c.mgr.tmuxAsUser(c.user, "set-option", "-t", name, "@xwb_tab", tabID).Run()
+	_ = c.mgr.tmuxAsUser(c.user, "set-option", "-t", name, "@xwb_kind", spec.Kind).Run()
+	i, _ := strconv.Atoi(idx)
+	_ = xwbTabAdd(c.user, spec.ID, XWBTab{Idx: i, Kind: spec.Kind, TabID: tabID, Name: name})
+
+	return name, c.Switch(name)
+}
+
+// XWBKind returns the xwb tab kind ("bash"/"claude") of a live session, or "".
+func (m *Manager) XWBKind(u *user.User, name string) string {
+	if !ValidName(name) {
+		return ""
+	}
+	out, err := m.tmuxAsUser(u, "show-options", "-t", name, "-v", "@xwb_kind").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// XWBTabID returns the xwb tab_id stored on a live session, or "".
+func (m *Manager) XWBTabID(u *user.User, name string) string {
+	if !ValidName(name) {
+		return ""
+	}
+	out, err := m.tmuxAsUser(u, "show-options", "-t", name, "-v", "@xwb_tab").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// rand.Read never fails on Linux; fall back to a fixed marker rather than panic.
+		return "000000000000"[:2*n]
+	}
+	return hex.EncodeToString(b)
 }
 
 // nextRemoteIndex returns the smallest free index n such that "<n>@<id>" is not

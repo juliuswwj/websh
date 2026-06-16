@@ -4,13 +4,28 @@
 
 A self-contained mobile shell-terminal **PWA**. Log in with a local account
 (PAM password + TOTP), then open as many **tmux** sessions as you like — ad-hoc
-local shells, or SSH to remotes from your config using your own `~/.ssh` keys.
-Because every session is a tmux session, dropped websockets don't lose your
-work: reconnecting reattaches to the live session.
+local shells, SSH to remotes from your config using your own `~/.ssh` keys, or
+**x-workbench (xwb)** servers. Because every session is a tmux session, dropped
+websockets don't lose your work: reconnecting reattaches to the live session.
 
 It is inspired by an internal tool that proxied terminals through an
 "x-workbench" service over websockets (fragile, disconnect-prone). websh owns
-the PTY/tmux itself and has no such dependency.
+the PTY/tmux itself, so local and SSH sessions have no such dependency; xwb is
+supported as an **optional third backend** for people who still need those
+servers — and websh papers over the flaky websocket by reconnecting for you.
+
+## Backends
+
+Every session shows up in the same picker and is driven by one tmux client:
+
+- **local** — `tmux new-session` on the box (created ad-hoc with "+ 新建 Bash").
+- **ssh** — a local tmux proxy whose pane runs `ssh … tmux new-session -A`, using
+  your own `~/.ssh` keys. Configured under `remotes:`.
+- **xwb** — an x-workbench server, reached over its websocket. Configured under
+  `remotes:` with `type: xwb` (plus a top-level `xwb:` account). Each xwb server
+  offers a **bash** and a **claude** tab. Since xwb's websocket is unstable and
+  it doesn't persist bash tab ids, websh stores them and **auto-reconnects** to
+  the same shell. See [xwb backend](#x-workbench-xwb-backend).
 
 ## Features
 
@@ -116,17 +131,48 @@ in the UI); add SSH targets under `remotes:` (see below).
 ```yaml
 otp_secret: "BASE32SECRET"     # filled in by `websh config`
 display_name: "Wen Jun"        # optional
+
+xwb:                           # optional; only needed for `type: xwb` remotes
+  host: "172.60.1.35:9630"     # upstream x-workbench host:port
+  email: "you@lango-tech.com"  # x-workbench account (used to fetch a JWT)
+  password: "••••••"
+
 remotes:
-  - host: "gpu01.internal"     # required; session id is derived from the host
+  - host: "gpu01.internal"     # ssh (the default type); id derived from the host
     name: "GPU 01"             # optional display name (defaults to host)
     user: "deploy"             # optional ssh login user
     port: 22                   # optional
     # id: gpu                  # optional override; only to disambiguate same host
+
+  - type: xwb                  # x-workbench server (see below)
+    ip: "10.0.0.5"             # required; the server's IP within x-workbench
+    # name: "GPU 5"            # optional display name (defaults to ip)
+    # id: gpu5                 # optional handle (defaults to slugified ip)
+    # credential_id: 219       # optional; default = auto-resolved
 ```
 
 `host` and `ssh_options` are validated; dangerous ssh options (`ProxyCommand`,
-`LocalCommand`, `PermitLocalCommand`) are rejected. Each remote uses the logged-in
-user's own `~/.ssh` keys.
+`LocalCommand`, `PermitLocalCommand`) are rejected. Each ssh remote uses the
+logged-in user's own `~/.ssh` keys.
+
+### x-workbench (xwb) backend
+
+Add the `xwb:` account once (email/password — websh logs in to get a JWT, cached
+under `~/.cache/websh/`), then list servers as `type: xwb` remotes named by their
+**IP** within x-workbench. `server_id` and `credential_id` are **resolved at
+runtime** via the xwb API, so you don't configure them (`credential_id` is an
+optional override). Each xwb server shows two create buttons in the picker —
+**＋ … · Bash** and **＋ … · Claude**:
+
+- **bash** tabs get a websh-generated id that is persisted to
+  `~/.cache/websh/xwb-tabs.json` (x-workbench doesn't keep it), so the shell
+  re-attaches after drops/restarts.
+- **claude** tabs are created via x-workbench and persisted upstream; killing one
+  in websh removes it there too.
+
+Because the xwb websocket is unstable, the per-tab bridge (`websh xwb-proxy`, run
+inside the tmux proxy session) **auto-reconnects** with backoff to the same tab,
+refreshing the JWT on expiry.
 
 ## Using the terminal
 
@@ -139,11 +185,31 @@ There is one terminal view; tap **≡ 会话** to open the session drawer.
   tap opens another, shown as `0@server`, `1@server`, … (i.e. tmux session `0`,
   `1`, … on `server`). They run on the remote and persist there independently, so
   reconnecting (or `0@server` again) reattaches the remote session.
+- **xwb server** — tap **＋ … · Bash** or **＋ … · Claude** to open a tab on an
+  x-workbench server (shown as `0@id`, `1@id`, …, like ssh). See
+  [the xwb backend](#x-workbench-xwb-backend).
 - **Rename** — ✎ in the drawer, or tap the session name in the header. (tmux
   names can't contain `.` `:` `|`.)
 - **Kill** — 🗑 in the drawer terminates a session.
 - **Char mode** quick keys include the tmux prefix **^B** (your session *is* a
   tmux session) and the readline cursor keys **^A**/**^E**.
+
+### Touch gestures
+
+On the terminal (one finger):
+
+- **Swipe up/down** — scroll like a mouse wheel; at a shell prompt this enters
+  tmux's scrollback to read history (and scrolls inside `vim`/`less`/`man`).
+- **Long-press, then drag** — select a range, like holding the left mouse button.
+  On release the selection is copied (to the device clipboard when the page is
+  served over HTTPS).
+- **Swipe left/right** — switch to the next/previous session.
+- **Tap** — when scrolled back into history, jump to the live bottom; otherwise
+  focus the keyboard. Two-finger pinch still zooms the font.
+
+websh enables tmux **mouse mode per session** (`set-option -t <session> mouse on`)
+for the sessions you open through it, so it doesn't change your other tmux
+sessions or your global config.
 
 ## Updating an installed PWA
 
@@ -209,13 +275,18 @@ everyone out.
 
 ```
 assets.go            //go:embed of static/ (web UI baked into the binary)
-cmd/websh/           HTTP server, auth, ws, push, notify endpoints
+cmd/websh/           HTTP server, auth, ws, push, notify endpoints; `xwb-proxy` subcommand
 cmd/websh-notify/    CLI for scripts / claude-code hook
-internal/config/     ~/.config/websh.yaml load + validation
+internal/config/     ~/.config/websh.yaml load + validation (local/ssh/xwb remotes)
 internal/auth/       PAM, TOTP, web-session store + cookie
-internal/session/    single tmux client attach + switch/new/rename/kill (priv drop)
+internal/session/    single tmux client attach + switch/new/rename/kill (priv drop); xwb tab store
 internal/bridge/     PTY <-> websocket, control frames, heartbeat, BEL scan
+internal/xwb/        x-workbench client: login/JWT cache, server/credential resolve, ws URLs
 internal/presence/   per-user foreground/background tracking + push decision
 internal/push/       VAPID + subscription store + send
 static/              PWA: index.html, app.js, service-worker.js, manifest, xterm
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 wenjun wang

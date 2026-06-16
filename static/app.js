@@ -87,9 +87,24 @@ function buildTerminal() {
   term.loadAddon(fit); term.open(wrap);
   setTimeout(() => { try { fit.fit(); } catch {} }, 30);
 
-  T = { term, fit, ws: null, mode: localStorage.getItem(KEYMODE_KEY) || 'sentence', retries: 0, closing: false, qk, cmdbar: cb };
+  // tmux (set-clipboard on) pushes copy-mode selections to us via OSC 52; mirror
+  // them to the device clipboard so a drag-selection is actually copyable.
+  try {
+    term.parser.registerOscHandler(52, (data) => {
+      const i = data.indexOf(';');
+      const b64 = i >= 0 ? data.slice(i + 1) : data;
+      try {
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        copyText(new TextDecoder().decode(bytes));
+      } catch {}
+      return true;
+    });
+  } catch {}
+
+  T = { term, fit, ws: null, mode: localStorage.getItem(KEYMODE_KEY) || 'sentence', retries: 0, closing: false, qk, cmdbar: cb, scrollAcc: 0 };
 
   attachPinch(wrap);
+  attachGestures(wrap);
   wrap.addEventListener('click', () => { if (T.mode === 'char') term.focus(); });
   term.onData(d => sendData(d));
   const sendCmd = () => { sendData(input.value + '\r'); input.value = ''; };
@@ -125,12 +140,33 @@ function renderKeys() {
     mk('^A', ctl('\x01')); mk('^E', ctl('\x05')); mk('^C', ctl('\x03')); mk('^D', ctl('\x04'));
     mk('^B', ctl('\x02')); mk('^K', ctl('\x0b')); mk('^U', ctl('\x15')); mk('^W', ctl('\x17')); mk('^R', ctl('\x12'));
     mk('^Z', ctl('\x1a')); mk('^L', ctl('\x0c')); mk('^T', ctl('\x14'));
-    mk('清屏', () => T.term.clear());
+    mk('🧹', () => T.term.clear()).title = '清屏';
   } else {
     T.cmdbar.style.display = '';
-    mk('Esc', ctl('\x1b')); mk('⇧Tab', ctl('\x1b[Z')); mk('^C', ctl('\x03')); mk('^B', ctl('\x02')); mk('清屏', () => T.term.clear());
+    mk('Esc', ctl('\x1b')); mk('⇧Tab', ctl('\x1b[Z')); mk('^C', ctl('\x03')); mk('^B', ctl('\x02')); mk('🧹', () => T.term.clear()).title = '清屏';
   }
-  mk('📋', openCopyPanel); mk('复制屏', () => copyText(termText())); mk('🔄', () => { T.retries = 0; connect(); });
+  mk('📋', openCopyPanel).title = '复制面板'; mk('📄', () => copyText(termText())).title = '复制屏'; mk('📥', pasteClipboard).title = '粘贴'; mk('🔄', () => { T.retries = 0; connect(); }).title = '重连';
+}
+
+// pasteClipboard reads the device clipboard and injects it into the terminal —
+// the mobile equivalent of Ctrl+Shift+V. Uses term.paste so bracketed-paste mode
+// is honored (a multi-line paste is delivered as one chunk, not auto-run). Falls
+// back to a prompt when the clipboard API is blocked (non-HTTPS or denied).
+async function pasteClipboard() {
+  let text = '';
+  try {
+    if (navigator.clipboard && navigator.clipboard.readText && window.isSecureContext) {
+      text = await navigator.clipboard.readText();
+    }
+  } catch {}
+  if (!text) {
+    const p = prompt('粘贴内容到终端：');
+    if (p == null) return;
+    text = p;
+  }
+  if (!text) return;
+  try { T.term.paste(text); } catch { sendData(text); }
+  if (T.mode === 'char') T.term.focus();
 }
 
 // ---- websocket -------------------------------------------------------------
@@ -147,7 +183,7 @@ function connect() {
   const ws = new WebSocket(wsURL());
   ws.binaryType = 'arraybuffer';
   T.ws = ws;
-  ws.onopen = () => { if (T.ws !== ws) return; T.retries = 0; setTimeout(() => { sendResize(); sendPresence(); }, 60); };
+  ws.onopen = () => { if (T.ws !== ws) return; T.retries = 0; T.scrollAcc = 0; quietLoadSessions(); setTimeout(() => { sendResize(); sendPresence(); }, 60); };
   ws.onmessage = (ev) => {
     if (T.ws !== ws) return;
     if (typeof ev.data === 'string') { handleCtl(ev.data); return; }
@@ -215,13 +251,21 @@ function renderSessions() {
   const wrap = $('#sessions'); wrap.innerHTML = '';
   wrap.appendChild(srvCard('➕', '新建 Bash', '本机新终端', () => newBash()));
   for (const q of state.remotes) {
-    wrap.appendChild(srvCard('🌐', '＋ ' + (q.name || q.id), 'ssh · ' + (q.host || ''), () => newRemote(q.id)));
+    if (q.type === 'xwb') {
+      // x-workbench servers offer both a bash and a claude tab.
+      wrap.appendChild(srvCard('🧩', '＋ ' + (q.name || q.id) + ' · Bash', 'xwb · ' + (q.host || ''), () => newRemote(q.id, 'bash')));
+      wrap.appendChild(srvCard('🤖', '＋ ' + (q.name || q.id) + ' · Claude', 'xwb · ' + (q.host || ''), () => newRemote(q.id, 'claude')));
+    } else {
+      wrap.appendChild(srvCard('🌐', '＋ ' + (q.name || q.id), 'ssh · ' + (q.host || ''), () => newRemote(q.id)));
+    }
   }
   if (state.live.length) wrap.appendChild(el('div', 'mut', '运行中的会话（点击切换）'));
   for (const s of state.live) {
     const cur = s.name === state.current;
-    const card = srvCard(s.type === 'ssh' ? '🌐' : '🖥️', s.name + (cur ? '  ·  当前' : ''),
-      (s.type === 'ssh' ? 'ssh' : 'bash') + (s.window ? ' · ' + s.window : '') + (s.attached ? ' · 已连接' : ''),
+    const icon = s.type === 'ssh' ? '🌐' : s.type === 'xwb' ? (s.xwb_kind === 'claude' ? '🤖' : '🧩') : '🖥️';
+    const typeLabel = s.type === 'xwb' ? ('xwb' + (s.xwb_kind ? '·' + s.xwb_kind : '')) : (s.type === 'ssh' ? 'ssh' : 'bash');
+    const card = srvCard(icon, s.name + (cur ? '  ·  当前' : ''),
+      typeLabel + (s.window ? ' · ' + s.window : '') + (s.attached ? ' · 已连接' : ''),
       () => switchTo(s.name));
     if (cur) card.classList.add('cur');
     const ren = el('button', 'btn-sm', '✎'); ren.onclick = (e) => { e.stopPropagation(); renameSession(s.name); };
@@ -231,9 +275,9 @@ function renderSessions() {
   }
 }
 
-function switchTo(name) { wsSend({ type: 'switch', target: name }); state.current = name; setTitle(); closeDrawer(); T.term.focus(); }
+function switchTo(name) { wsSend({ type: 'switch', target: name }); state.current = name; T.scrollAcc = 0; setTitle(); closeDrawer(); T.term.focus(); }
 function newBash() { wsSend({ type: 'new', kind: 'bash' }); closeDrawer(); T.term.focus(); }
-function newRemote(id) { wsSend({ type: 'new', kind: 'remote', id }); closeDrawer(); T.term.focus(); }
+function newRemote(id, xwb) { wsSend({ type: 'new', kind: 'remote', id, ...(xwb ? { xwb } : {}) }); closeDrawer(); T.term.focus(); }
 
 function remoteSuffix(name) {
   const at = name.lastIndexOf('@');
@@ -322,6 +366,122 @@ function fallbackCopy(text) {
   try { document.execCommand('copy'); toast('已复制'); } catch { toast('复制失败'); }
   ta.remove();
 }
+// ---- 触摸手势 --------------------------------------------------------------
+// 单指上下滑 = 鼠标滚轮（tmux 滚屏看历史）；长按后拖动 = 鼠标左键拖选；
+// 单指左右滑 = 切换 session；滚到历史后轻点 = 回到底部。依赖会话已开启 tmux
+// 鼠标模式（服务端在 attach/switch 时按会话开启）。
+const GEST = { tapMove: 8, longMs: 330, swipeMin: 36, stepPx: 22, returnCap: 240 };
+
+// termCell maps a touch point to a 1-based tmux cell (col,row) using xterm's
+// rendered screen element, so it works without xterm internals.
+function termCell(t) {
+  const screen = (T.term.element && T.term.element.querySelector('.xterm-screen')) || T.term.element;
+  const r = screen.getBoundingClientRect();
+  const cols = T.term.cols || 80, rows = T.term.rows || 24;
+  let col = Math.floor((t.clientX - r.left) / (r.width / cols)) + 1;
+  let row = Math.floor((t.clientY - r.top) / (r.height / rows)) + 1;
+  col = Math.max(1, Math.min(cols, col));
+  row = Math.max(1, Math.min(rows, row));
+  return { col, row };
+}
+// sgrMouse sends one SGR mouse event (button, cell, press/release).
+function sgrMouse(btn, col, row, press) { sendData(`\x1b[<${btn};${col};${row}${press ? 'M' : 'm'}`); }
+
+function returnToBottom() {
+  const n = Math.min(GEST.returnCap, T.scrollAcc || 0);
+  const col = Math.max(1, Math.floor((T.term.cols || 80) / 2));
+  const row = Math.max(1, Math.floor((T.term.rows || 24) / 2));
+  for (let i = 0; i < n; i++) sgrMouse(65, col, row, true); // wheel down -> tmux exits copy-mode at bottom
+  T.scrollAcc = 0;
+}
+
+function switchAdjacent(dir) {
+  const go = () => {
+    const list = state.live || [];
+    if (list.length < 2) return;
+    let i = list.findIndex(s => s.name === state.current);
+    if (i < 0) i = 0;
+    const name = list[(i + dir + list.length) % list.length].name;
+    if (name && name !== state.current) { switchTo(name); toast('▸ ' + name); }
+  };
+  if ((state.live || []).length < 2) quietLoadSessions().then(go); else go();
+}
+
+async function quietLoadSessions() {
+  try { const r = await api('/api/sessions'); state.live = r.live || []; state.remotes = r.remotes || []; } catch {}
+}
+
+function attachGestures(wrap) {
+  wrap.style.touchAction = 'none'; // we own single-finger gestures
+  let g = null;
+  const clearG = () => { if (g && g.lp) clearTimeout(g.lp); g = null; };
+
+  wrap.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) { clearG(); return; } // 2 fingers -> pinch zoom
+    const t = e.touches[0];
+    g = { x0: t.clientX, y0: t.clientY, lastY: t.clientY, acc: 0, mode: null, lastCell: null, lp: null };
+    g.lp = setTimeout(() => {
+      if (!g || g.mode) return;
+      g.mode = 'select';
+      const c = termCell(t);
+      g.lastCell = c;
+      sgrMouse(0, c.col, c.row, true); // left press
+      if (navigator.vibrate) navigator.vibrate(12);
+    }, GEST.longMs);
+  }, { passive: true });
+
+  wrap.addEventListener('touchmove', (e) => {
+    if (!g || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const dx = t.clientX - g.x0, dy = t.clientY - g.y0;
+    if (g.mode === null) {
+      if (Math.abs(dx) < GEST.tapMove && Math.abs(dy) < GEST.tapMove) return;
+      clearTimeout(g.lp);
+      g.mode = Math.abs(dx) > Math.abs(dy) ? 'hswipe' : 'scroll';
+      g.lastY = t.clientY; g.acc = 0;
+    }
+    if (g.mode === 'scroll') {
+      e.preventDefault();
+      g.acc += t.clientY - g.lastY; g.lastY = t.clientY;
+      while (Math.abs(g.acc) >= GEST.stepPx) {
+        const up = g.acc > 0; // finger down -> reveal older history -> wheel up
+        g.acc += up ? -GEST.stepPx : GEST.stepPx;
+        const c = termCell(t);
+        sgrMouse(up ? 64 : 65, c.col, c.row, true);
+        T.scrollAcc = Math.max(0, (T.scrollAcc || 0) + (up ? 1 : -1));
+      }
+    } else if (g.mode === 'select') {
+      e.preventDefault();
+      const c = termCell(t);
+      if (!g.lastCell || c.col !== g.lastCell.col || c.row !== g.lastCell.row) {
+        g.lastCell = c;
+        sgrMouse(32, c.col, c.row, true); // left-button drag motion
+      }
+    } else if (g.mode === 'hswipe') {
+      e.preventDefault();
+    }
+  }, { passive: false });
+
+  wrap.addEventListener('touchend', (e) => {
+    if (!g) return;
+    if (g.lp) clearTimeout(g.lp);
+    const t = e.changedTouches[0];
+    const dx = t.clientX - g.x0;
+    if (g.mode === 'select') {
+      const c = termCell(t);
+      sgrMouse(0, c.col, c.row, false); // release -> tmux copies selection
+    } else if (g.mode === 'hswipe') {
+      if (Math.abs(dx) >= GEST.swipeMin) switchAdjacent(dx < 0 ? 1 : -1); // left -> next
+    } else if (g.mode === null) {
+      if ((T.scrollAcc || 0) > 0) returnToBottom();
+      else if (T.mode === 'char') T.term.focus();
+    }
+    g = null;
+  }, { passive: false });
+
+  wrap.addEventListener('touchcancel', clearG, { passive: true });
+}
+
 function attachPinch(elm) {
   let startDist = 0, startFont = fontSize;
   const dist = (e) => Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);

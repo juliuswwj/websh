@@ -48,9 +48,10 @@ type Bridge struct {
 	// OnSwitch switches the tmux client to target; returns the resulting session
 	// name (or "" on failure).
 	OnSwitch func(target string) string
-	// OnNew creates a session (kind "bash"|"remote", id for remotes) and switches
-	// to it; returns the new session name (or "" on failure).
-	OnNew func(kind, id string) string
+	// OnNew creates a session (kind "bash"|"remote", id for remotes; xwbKind
+	// "bash"|"claude" selects the tab type for xwb remotes) and switches to it;
+	// returns the new session name (or "" on failure).
+	OnNew func(kind, id, xwbKind string) string
 	// Heartbeat overrides the ping interval (keeps idle connections alive
 	// through reverse-proxy idle timeouts). Zero uses the default.
 	Heartbeat time.Duration
@@ -172,6 +173,7 @@ func (b *Bridge) readWS(ctx context.Context) {
 			Target string `json:"target"`
 			Kind   string `json:"kind"`
 			ID     string `json:"id"`
+			XWB    string `json:"xwb"` // for "new" on an xwb remote: "bash"|"claude"
 		}
 		if json.Unmarshal(data, &m) != nil {
 			continue
@@ -193,7 +195,7 @@ func (b *Bridge) readWS(ctx context.Context) {
 			}
 		case "new":
 			if b.OnNew != nil {
-				if name := b.OnNew(m.Kind, m.ID); name != "" {
+				if name := b.OnNew(m.Kind, m.ID, m.XWB); name != "" {
 					b.sendSession(name)
 				}
 			}
