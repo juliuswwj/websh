@@ -67,11 +67,12 @@
   <strong>手机断网、息屏、切后台都不会丢</strong>——重新打开会自动接回原来的对话。</p>
 
   <div class="callout danger">
-    <div class="t">🚫 最重要的一点：只能在「外网」访问</div>
-    <p style="margin:6px 0 0">下面这个网址<strong>只有在外网（公司内网访问不到）</strong>才能打开：</p>
+    <div class="t">🚫 最重要的一点：公司内网打不开，换个网络就行</div>
+    <p style="margin:6px 0 0">下面这个网址<strong>在公司内网里访问不到</strong>：</p>
     <div class="url">https://ai.rainier.lango-tech.com/websh/</div>
-    <p style="margin:6px 0 0">所以在手机上请<strong>关闭公司 Wi-Fi、改用 4G/5G 流量</strong>（或其它外部网络）再打开。
-    如果用着公司内网怎么刷都打不开，<strong>这是正常的</strong>，不是坏了——切到流量即可。</p>
+    <p style="margin:6px 0 0">打不开通常是连了 <strong>Lango-5G、Lango-GMS</strong> 这类公司内网 Wi-Fi。
+    <strong>只要换成非内网的网络就能打开</strong>——比如 <strong>Lango-VIP</strong>、你<strong>家里的宽带</strong>，或者手机流量都行。
+    在公司内网怎么刷都出不来<strong>是正常的</strong>，不是坏了。</p>
   </div>
 
   <h2>一、首次配置（在服务器上做一次）</h2>
@@ -116,9 +117,9 @@ remotes:
   <h2>二、在手机上打开并登录</h2>
   <ol class="steps">
     <li>
-      <h3>切到外网，打开网址</h3>
-      <p>手机<strong>关 Wi-Fi 用流量</strong>，浏览器打开
-      <a href="https://ai.rainier.lango-tech.com/websh/">https://ai.rainier.lango-tech.com/websh/</a>。</p>
+      <h3>换到非公司内网，打开网址</h3>
+      <p>只要<strong>不是 Lango-5G / Lango-GMS 这类公司内网</strong>（Lango-VIP、家里宽带、手机流量都行），
+      浏览器打开 <a href="https://ai.rainier.lango-tech.com/websh/">https://ai.rainier.lango-tech.com/websh/</a>。</p>
     </li>
     <li>
       <h3>装到主屏幕（推荐）</h3>
@@ -185,7 +186,8 @@ remotes:
 
   <details>
     <summary>网址怎么都打不开 / 一直转圈</summary>
-    <p>八成是连着公司内网。<strong>关掉 Wi-Fi、用手机流量</strong>再试——这个地址只对外网开放。</p>
+    <p>八成是连着公司内网 Wi-Fi（<strong>Lango-5G、Lango-GMS</strong> 等）。换成<strong>非内网的网络</strong>再试——
+    Lango-VIP、家里宽带、手机流量都行。</p>
   </details>
   <details>
     <summary>登录失败 / 验证码不对</summary>
