@@ -79,10 +79,18 @@
   <p>第一次使用前，需要在你的服务器账号里建一个配置文件。这一步要登录服务器操作一次，
   之后手机端就一直能用了。<strong>如果你对命令行不熟，可以照抄下面的命令，或找运维/同事帮忙跑一遍。</strong></p>
 
+  <div class="callout tip">
+    <div class="t">🔌 这一步要在公司内网里做（和手机端正好相反）</div>
+    <p style="margin:6px 0 0">配置需要 SSH 登录服务器，<strong>必须在公司内网（包括有线网络）</strong>下操作。
+    在电脑的终端里运行下面命令登录（把 <code>user</code> 换成你的服务器账号）：</p>
+    <pre><code>ssh user@192.168.21.240</code></pre>
+    <p style="margin:6px 0 0">记住：<strong>配置在公司内网做、手机日常用在非内网做</strong>，两边要求的网络正好相反。</p>
+  </div>
+
   <ol class="steps">
     <li>
       <h3>生成登录验证码（TOTP）</h3>
-      <p>SSH 登录服务器后，运行：</p>
+      <p>连上服务器后，运行：</p>
       <pre><code>websh config</code></pre>
       <p>它会在终端里<strong>打印一个二维码</strong>。用手机上的<strong>身份验证器 App</strong>
       （Google Authenticator、Microsoft Authenticator、1Password 等）扫这个码，
